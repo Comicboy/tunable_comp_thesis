@@ -12,40 +12,29 @@ from isaaclab.assets import ArticulationCfg
 
 from .paths import DATA_DIR
 
-WUJI_HAND_LEFT_CFG = ArticulationCfg(
-    spawn=sim_utils.UsdFileCfg(
-        usd_path=str(DATA_DIR / "wuji_hand" / "left" / "wujihand.usd"),
-        articulation_props=sim_utils.ArticulationRootPropertiesCfg(
-            enabled_self_collisions=True, # It is set to true because the fingers can (and kinda should) collide with each other and the palm
-        ),
-    ),
-    init_state=ArticulationCfg.InitialStateCfg(
-        joint_pos={"left_finger.*_joint1": 0.06}, # The first joint of each winger is slightly spread, everything else is 0
-    ),
-    actuators={
-        "fingers": ImplicitActuatorCfg(
-            joint_names_expr=["left_finger.*_joint.*"],
-            stiffness=None, # Wuji includes the sys identified values for stiffness and damping so we take thouse from  the usd file
-            damping=None,
-        ),
-    },
-)
 
-WUJI_HAND_RIGHT_CFG = ArticulationCfg(
-    spawn=sim_utils.UsdFileCfg(
-        usd_path=str(DATA_DIR / "wuji_hand" / "right" / "wujihand.usd"),
-        articulation_props=sim_utils.ArticulationRootPropertiesCfg(
-            enabled_self_collisions=True, # It is set to true because the fingers can (and kinda should) collide with each other and the palm
+def _make_wuji_hand_cfg(side: str) -> ArticulationCfg:
+    """Build the configuration for one hand. `side` is "left" or "right"."""
+    return ArticulationCfg(
+        spawn=sim_utils.UsdFileCfg(
+            usd_path=str(DATA_DIR / "wuji_hand" / side / "wujihand.usd"),
+            articulation_props=sim_utils.ArticulationRootPropertiesCfg(
+                enabled_self_collisions=True, # It is set to true because the fingers can (and kinda should) collide with each other and the palm
+            ),
+            activate_contact_sensors=True
         ),
-    ),
-    init_state=ArticulationCfg.InitialStateCfg(
-        joint_pos={"right_finger.*_joint1": 0.06}, # The first joint of each finger is slightly spread, everything else is 0
-    ),
-    actuators={
-        "fingers": ImplicitActuatorCfg(
-            joint_names_expr=["right_finger.*_joint.*"],
-            stiffness=None, # Wuji includes the sys identified values for stiffness and damping so we take those from  the usd file
-            damping=None,
+        init_state=ArticulationCfg.InitialStateCfg(
+            joint_pos={f"{side}_finger.*_joint1": 0.06}, # The first joint of each finger is slightly spread, everything else is 0
         ),
-    },
-)
+        actuators={
+            "fingers": ImplicitActuatorCfg(
+                joint_names_expr=[f"{side}_finger.*_joint.*"],
+                stiffness=None, # Wuji includes the sys identified values for stiffness and damping so we take those from  the usd file
+                damping=None,
+            ),
+        },
+    )
+
+
+WUJI_HAND_LEFT_CFG = _make_wuji_hand_cfg("left")
+WUJI_HAND_RIGHT_CFG = _make_wuji_hand_cfg("right")

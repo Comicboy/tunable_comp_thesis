@@ -4,37 +4,43 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 
-"""Configuration for the Universal Robots UR5 robot
+"""Configuration for the Universal Robots UR5 robot.
+
+The following configuration parameters are available:
+
+* :obj:`UR5_CFG`: The UR5 arm without an end effector.
+
+The joints are left at the drive gains authored in the USD, which approximate an
+ideal position source.
 
 Sources:
 - https://github.com/UniversalRobots/Universal_Robots_ROS2_Description/blob/ros2/config/ur5/joint_limits.yaml
 - https://www.universal-robots.com/media/50573/ur5_bz.pdf
-
-
 """
+
+import numpy as np
 
 import isaaclab.sim as sim_utils
 from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.assets.articulation import ArticulationCfg
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
-import numpy as np
+
+from .paths import DATA_DIR
 
 ##
 # Configuration
 ##
-
-# TODO: Figure out how to derive the damping and stiffness through simulation (if possible) or measure it somehow with the real robot. => Check the textbook for formulas and stuff
-
 UR5_CFG = ArticulationCfg(
     spawn=sim_utils.UsdFileCfg(
-        usd_path=f"{ISAAC_NUCLEUS_DIR}/Robots/UniversalRobots/ur5/ur5.usd",
+        usd_path=str(DATA_DIR / "ur5" / "ur5.usd"),
         rigid_props=sim_utils.RigidBodyPropertiesCfg(
             disable_gravity=False,
             max_depenetration_velocity=5.0,
         ),
         activate_contact_sensors=False,
     ),
-    init_state=ArticulationCfg.InitialStateCfg( # This specifies the initial state i.e. all the joint angles of the robot when it is spawned in rad
+    # Initial joint angles in rad, applied at spawn and on every reset.
+    init_state=ArticulationCfg.InitialStateCfg(
         joint_pos={
             "shoulder_pan_joint": 0.0,
             "shoulder_lift_joint": -1.712,
@@ -44,21 +50,24 @@ UR5_CFG = ArticulationCfg(
             "wrist_3_joint": 0.0,
         },
     ),
-    # This describes how the joints behave, all of them are modelled as a PD controller with a spring-damper built into the joints with tau = Kp (q_target - q) + Kd (qd_target - qd)
+    # Joint model used for the actuators (PD controller): tau = Kp (q_target - q) + Kd (qd_target - qd), computed
+    # Gains found in the usd file (originally stored in degrees):
+    #   arm joints    Kp = 57779 N m/rad, Kd = 229 N m s/rad
+    #   wrist joints  Kp = 21762 N m/rad, Kd =  87 N m s/rad
     actuators={
         "shoulder_elbow": ImplicitActuatorCfg(
             joint_names_expr=["shoulder_.*", "elbow_joint"],
-            effort_limit_sim=150.0,   # Nm
-            velocity_limit_sim=np.pi,  # rad/s
-            stiffness=800.0,          # NA should be designed as Kp = w^2 J
-            damping=40.0,             # NA should be designed as Kd = 2 zeta w J
+            effort_limit_sim=150.0,     # Nm
+            velocity_limit_sim=np.pi,   # rad/s
+            stiffness=None,             # keep the USD's gains
+            damping=None,
         ),
-        "wrist": ImplicitActuatorCfg(
+        "arm_wrist": ImplicitActuatorCfg(
             joint_names_expr=["wrist_.*"],
-            effort_limit_sim=28.0,    # Nm
-            velocity_limit_sim=3.14,  # rad/s
-            stiffness=400.0,          # placeholder same as above
-            damping=20.0,             # placeholder same as above
+            effort_limit_sim=28.0,      # Nm
+            velocity_limit_sim=np.pi,   # rad/s
+            stiffness=None,             # keep the USD's gains
+            damping=None,
         ),
     },
 )

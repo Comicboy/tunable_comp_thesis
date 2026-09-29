@@ -37,7 +37,7 @@ UR5_CFG = ArticulationCfg(
             disable_gravity=False,
             max_depenetration_velocity=5.0,
         ),
-        activate_contact_sensors=False,
+        activate_contact_sensors=True,
     ),
     # Initial joint angles in rad, applied at spawn and on every reset.
     init_state=ArticulationCfg.InitialStateCfg(

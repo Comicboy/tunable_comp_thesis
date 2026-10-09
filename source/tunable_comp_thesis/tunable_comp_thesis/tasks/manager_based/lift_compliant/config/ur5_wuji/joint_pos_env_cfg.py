@@ -42,9 +42,9 @@ class UR5WujiCubeLiftEnvCfg(LiftEnvCfg):
             use_default_offset=True,
         )
 
-        # 20 finger joint position targets
-        # since a 20-DoF hand has no single "closed" state as the franka gripper had
-        self.actions.hand_action = mdp.JointPositionActionCfg(
+        # 20 finger joint references, with a Cartesian admittance at each fingertip.
+        # stiffness_values defaults to [inf] (admittance off); experiments set it per env.
+        self.actions.hand_action = mdp.FingertipAdmittanceActionCfg(
             asset_name="robot",
             joint_names=["right_finger.*"],
             scale=1.0,

@@ -49,6 +49,7 @@ class UR5WujiCubeLiftEnvCfg(LiftEnvCfg):
             joint_names=["right_finger.*"],
             scale=1.0,
             use_default_offset=True,
+            object_sensor_names=[f"tip{f}_object_contact" for f in range(1, 6)],
         )
 
         # Body the object pose command is tracked against
@@ -82,6 +83,14 @@ class UR5WujiCubeLiftEnvCfg(LiftEnvCfg):
             update_period=0.0,
             history_length=6,
         )
+        # one sensor per tip, only the force from the cube
+        for f in range(1, 6):
+            setattr(self.scene, f"tip{f}_object_contact", ContactSensorCfg(
+            prim_path=f"{{ENV_REGEX_NS}}/Robot/WujiHand/right_finger{f}_tip_link",
+            update_period=0.0,
+            history_length=6,
+            filter_prim_paths_expr=["{ENV_REGEX_NS}/Object"],
+    ))
 
         # End-effector frame: grasp point relative to the robot base
         marker_cfg = FRAME_MARKER_CFG.copy()

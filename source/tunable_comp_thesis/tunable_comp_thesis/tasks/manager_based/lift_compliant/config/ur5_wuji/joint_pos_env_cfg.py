@@ -83,13 +83,15 @@ class UR5WujiCubeLiftEnvCfg(LiftEnvCfg):
             update_period=0.0,
             history_length=6,
         )
-        # one sensor per tip, only the force from the cube
+        # One sensor per tip, only the force from the cube is registered
+        # Important modification since before the sensors read all forces, both the forces exerted by the object but also the forces exerted
+        # by the other fingers which shouldn't influence the admittance law!
         for f in range(1, 6):
             setattr(self.scene, f"tip{f}_object_contact", ContactSensorCfg(
             prim_path=f"{{ENV_REGEX_NS}}/Robot/WujiHand/right_finger{f}_tip_link",
             update_period=0.0,
             history_length=6,
-            filter_prim_paths_expr=["{ENV_REGEX_NS}/Object"],
+            filter_prim_paths_expr=["{ENV_REGEX_NS}/Object"], # here we add a filter path to register the forces between the fingertips and the object
     ))
 
         # End-effector frame: grasp point relative to the robot base

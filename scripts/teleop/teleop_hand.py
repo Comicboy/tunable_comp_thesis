@@ -25,6 +25,15 @@ Run (two terminals):
 
 Operating it: right hand drives the fingers, a LEFT-hand pinch freezes them (they hold the last
 reference). If the stream stops or the right hand is lost, the fingers also hold.
+
+Speed (measured 2026-10-24, one env, GUI): teleop needs the simulation to keep up with real time
+(one 20 ms env step per 20 ms of wall-clock time). Two defaults of this script make that possible:
+
+* physics on the CPU (--device cpu): for a single env the GPU spends 10-19 ms per env step on
+  overhead, the CPU 1-2 ms. Pass --device cuda:0 to override.
+* the GUI's frame limiter and vsync are switched off (FRAME_LIMIT_OFF): with them every rendered
+  frame took ~20 ms (~40 ms when rendering only every second step), without them ~6 ms.
+Result: ~10.5 ms per env step, real time x1.00.
 """
 
 import argparse
@@ -36,15 +45,29 @@ parser = argparse.ArgumentParser(description="Quest 3 -> Wuji hand teleoperation
 parser.add_argument("--stiffness", type=float, default=math.inf, help="K [N/m] of the fingertip admittance; inf = off")
 parser.add_argument("--controller", choices=["dynamic", "static"], default="dynamic")
 parser.add_argument("--udp", default="127.0.0.1:9870", help="HOST:PORT the stream is sent to (stream_joints.py --to)")
+parser.add_argument("--arm_init", nargs="+", default=[], metavar="JOINT=RAD",
+                    help="override start angles of arm joints, e.g. --arm_init wrist_2_joint=1.5708 "
+                         "(defaults in assets/ur5.py: pan 0, lift -1.712, elbow 1.712, wrists 0)")
 parser.add_argument("--ee_pos", type=float, nargs=3, default=None,
                     help="grasp point position to hold, robot base frame [m] (default: the start pose)")
 parser.add_argument("--cam_eye", type=float, nargs=3, default=[0.30, -0.30, 0.15],
                     help="camera position relative to the palm [m] (the camera follows the palm)")
 parser.add_argument("--cam_lookat", type=float, nargs=3, default=[0.0, 0.0, -0.05],
                     help="point the camera looks at, relative to the palm [m]")
+parser.add_argument("--render_every", type=int, default=1,
+                    help="draw the GUI every N env steps (1 = 50 fps, 2 = 25 fps); rendering is the main cost")
 parser.add_argument("--print_every", type=int, default=50, help="status line every N env steps (50 = 1 s)")
+parser.add_argument("--profile", action="store_true",
+                    help="also print where the time of an env step goes (physics, rendering, action terms, ...)")
 AppLauncher.add_app_launcher_args(parser)
+parser.set_defaults(device="cpu")  # see "Speed" above; --device cuda:0 still works
 args_cli = parser.parse_args()
+
+# Kit settings for the GUI: no frame-rate limit, no vsync (see "Speed" above). Kept together with
+# anything given on the command line via --kit_args.
+FRAME_LIMIT_OFF = "--/app/runLoops/main/rateLimitEnabled=false --/app/vsync=false"
+args_cli.kit_args = f"{args_cli.kit_args or ''} {FRAME_LIMIT_OFF}".strip()
+
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
@@ -55,6 +78,7 @@ import time
 import gymnasium as gym
 import torch
 
+from isaaclab.utils.math import matrix_from_quat
 from isaaclab_tasks.utils import parse_env_cfg
 
 import tunable_comp_thesis.tasks  # noqa: F401  (registers the gym tasks)
@@ -140,6 +164,57 @@ class QuestReceiver:
 
 
 # ------------------------------------------------------------------------------------------------
+# profiler (--profile)
+# ------------------------------------------------------------------------------------------------
+
+class StepProfiler:
+    """Measures how long the parts of an env step take, by wrapping the methods the env calls.
+
+    env.step() runs, per env step: the action terms' process_actions, then `decimation` (2) times
+    {action terms' apply_actions, scene.write_data_to_sim, sim.step (physics), sim.render (GUI, every
+    render_interval), scene.update (sensors)}, then the managers (rewards, terminations, commands,
+    observations). The wrapped parts are timed; "rest" is env.step minus all of them.
+    On the GPU the work is asynchronous, so every timer synchronises first (slightly slower, but the
+    time is then charged to the part that caused it).
+    """
+
+    def __init__(self, sync: bool):
+        self.sync = sync
+        self.total: dict[str, float] = {}
+        self.steps = 0
+
+    def _now(self) -> float:
+        if self.sync:
+            torch.cuda.synchronize()
+        return time.perf_counter()
+
+    def wrap(self, obj, method: str, label: str):
+        fn = getattr(obj, method)
+
+        def timed(*args, **kwargs):
+            t0 = self._now()
+            out = fn(*args, **kwargs)
+            self.total[label] = self.total.get(label, 0.0) + self._now() - t0
+            return out
+
+        setattr(obj, method, timed)  # instance attribute: only this object is affected
+
+    def add(self, label: str, seconds: float):
+        self.total[label] = self.total.get(label, 0.0) + seconds
+
+    def report(self) -> str:
+        """Average milliseconds per env step since the last report, then reset."""
+        n = max(self.steps, 1)
+        step = self.total.pop("env.step", 0.0)
+        parts = dict(self.total)
+        parts["rest (managers)"] = step - sum(parts.values())
+        text = f"           per env step {1000 * step / n:5.1f} ms = " + ", ".join(
+            f"{k} {1000 * v / n:.1f}" for k, v in parts.items())
+        self.total, self.steps = {}, 0
+        return text
+
+
+# ------------------------------------------------------------------------------------------------
 # main
 # ------------------------------------------------------------------------------------------------
 
@@ -151,6 +226,17 @@ def main():
         AdmittanceControllerCfg() if args_cli.controller == "dynamic" else StaticAdmittanceControllerCfg()
     )
     env_cfg.episode_length_s = 3600.0  # the scripted env times out after 20 s; teleop runs until closed
+    # optional start pose of the arm (only for this run; the robot config itself is not changed)
+    joint_pos = dict(env_cfg.scene.robot.init_state.joint_pos)
+    for item in args_cli.arm_init:
+        name, _, value = item.partition("=")
+        if name not in joint_pos:
+            raise SystemExit(f"[teleop] --arm_init: unknown joint '{name}'; arm joints: "
+                             f"{[n for n in joint_pos if not n.startswith('right_')]}")
+        joint_pos[name] = float(value)
+    env_cfg.scene.robot.init_state.joint_pos = joint_pos
+    # the env renders once per env step (render_interval = decimation); fewer frames leave more time for physics
+    env_cfg.sim.render_interval = env_cfg.decimation * max(1, args_cli.render_every)
     # the camera follows the palm, so the hand stays in view wherever the arm is
     env_cfg.viewer.origin_type = "asset_body"
     env_cfg.viewer.asset_name = "robot"
@@ -165,6 +251,16 @@ def main():
     robot = uw.scene["robot"]
     dev, dt = uw.device, uw.step_dt
 
+    prof = None
+    if args_cli.profile:
+        prof = StepProfiler(sync=str(dev).startswith("cuda"))
+        prof.wrap(hand, "apply_actions", "hand action")  # admittance + Jacobians, every physics step
+        prof.wrap(arm, "apply_actions", "arm DiffIK")
+        prof.wrap(uw.scene, "write_data_to_sim", "write")
+        prof.wrap(uw.sim, "step", "physics")
+        prof.wrap(uw.sim, "render", "render")
+        prof.wrap(uw.scene, "update", "sensors")
+
     # --- joint mapping, printed so it can be checked once -----------------------------------------------
     perm = torch.tensor([bridge_index(n) for n in hand.joint_names], device=dev)
     assert sorted(perm.tolist()) == list(range(20)), "the mapping does not use every bridge angle exactly once"
@@ -177,6 +273,15 @@ def main():
     env.reset()
     p_hold, quat_hold = arm._compute_frame_pose()  # grasp point pose in the base frame, (1, 3), (1, 4)
     print(f"\n[teleop] grasp point at the start (base frame): {[round(v, 3) for v in p_hold[0].tolist()]} m")
+    arm_ids = robot.find_joints(["shoulder_.*", "elbow_joint", "wrist_.*"], preserve_order=True)[0]
+    arm_q = robot.data.joint_pos[0, arm_ids].tolist()
+    print("[teleop] arm joints [rad]: " + ", ".join(
+        f"{robot.joint_names[i]} {q:+.3f}" for i, q in zip(arm_ids, arm_q)))
+    # palm frame axes in the base frame: +z points along the fingers, +x out of the palm face
+    R = matrix_from_quat(quat_hold)[0]
+    fingers, palm = R[:, 2].tolist(), R[:, 0].tolist()
+    print(f"[teleop] fingers point along {[round(v, 2) for v in fingers]}, palm faces {[round(v, 2) for v in palm]} "
+          "(base frame: +x forward, +y left, +z up)")
     if args_cli.ee_pos is not None:
         p_hold = torch.tensor([args_cli.ee_pos], dtype=torch.float, device=dev)
         print(f"[teleop] holding it at --ee_pos {args_cli.ee_pos} instead")
@@ -184,12 +289,15 @@ def main():
     q_ref = robot.data.default_joint_pos[:, hand_ids].clone()  # (1, 20), absolute [rad]
 
     k_name = "inf (admittance off)" if math.isinf(args_cli.stiffness) else f"{args_cli.stiffness:g} N/m"
-    print(f"[teleop] K = {k_name}, {args_cli.controller} controller, env step {1000 * dt:.0f} ms")
+    print(f"[teleop] K = {k_name}, {args_cli.controller} controller, env step {1000 * dt:.0f} ms, "
+          f"GUI every {args_cli.render_every} step(s), device {dev}")
 
     rx = QuestReceiver(args_cli.udp)
     print(f"[teleop] listening on {args_cli.udp} for stream_joints.py; Ctrl-C or close the window to stop\n")
 
     # --- loop -------------------------------------------------------------------------------------------
+    if prof is not None:
+        prof.total, prof.steps = {}, 0  # forget what env.reset() spent in the wrapped methods
     step, count_prev, warned_no_q = 0, 0, False
     t_next = t_print = time.perf_counter()
     late = 0  # steps that could not keep up with real time
@@ -216,20 +324,30 @@ def main():
                 q_ref = q_bridge[perm].unsqueeze(0)  # (1, 20) in the action's joint order
 
             # arm: same pose every step (DiffIK holds it); hand: the reference
+            if prof is not None:
+                t0 = prof._now()
             env.step(torch.cat([p_hold, quat_hold, q_ref], dim=-1))
+            if prof is not None:
+                prof.add("env.step", prof._now() - t0)
+                prof.steps += 1
             step += 1
 
             # status line, about once a second
             if args_cli.print_every and step % args_cli.print_every == 0:
                 now = time.perf_counter()
-                rate = (rx.count - count_prev) / max(now - t_print, 1e-6)
+                wall = max(now - t_print, 1e-6)  # wall-clock time since the last status line [s]
+                rate = (rx.count - count_prev) / wall
+                rtf = args_cli.print_every * dt / wall  # simulated s per wall-clock s; 1.0 = real time
                 count_prev, t_print = rx.count, now
                 forces = hand.tip_forces[0].norm(dim=-1).tolist()  # |f| per fingertip [N], thumb first
                 thumb = [q_ref[0, k].item() for k, n in enumerate(hand.joint_names) if "finger1_" in n]
                 state = "LIVE" if live else f"held: {reason}"
                 print(f"[{step * dt:7.1f} s] stream {rate:4.1f} Hz, {rx.gaps} gaps | {state:<40.40} | "
                       f"thumb q_ref {' '.join(f'{v:+.2f}' for v in thumb)} | "
-                      f"|f| tips {' '.join(f'{v:4.1f}' for v in forces)} N | late steps {late}")
+                      f"|f| tips {' '.join(f'{v:4.1f}' for v in forces)} N | "
+                      f"real time x{rtf:.2f}, late steps {late}")
+                if prof is not None:
+                    print(prof.report())
 
             # real time: one env step per dt of wall-clock time, so the hand moves with yours
             t_next += dt

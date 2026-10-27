@@ -39,6 +39,11 @@ class StaticAdmittanceController:
         """Current offset e [m], shape (N, P, 3)."""
         return self._e
 
+    @property
+    def filtered_force(self) -> torch.Tensor:
+        """The smoothed force f_filt the law works with [N], shape (N, P, 3) (EMA, force_filter_alpha)."""
+        return self._f_filt
+
     def min_stable_stiffness(self, drive_stiffness: float) -> float:
         """Lowest K for which the contact loop is stable, given the drives' stiffness at the tip [N/m].
 

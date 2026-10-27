@@ -49,6 +49,11 @@ class AdmittanceController:
         return self._e
 
     @property
+    def filtered_force(self) -> torch.Tensor:
+        """The smoothed force f_filt the law works with [N], shape (N, P, 3) (EMA, force_filter_alpha)."""
+        return self._f_filt
+
+    @property
     def max_stable_stiffness(self) -> float:
         """Stiffness above which the Euler update goes unstable [N/m].
         Critically damped semi-implicit Euler is stable while w*dt < 2(sqrt(2) - 1) = 0.83."""

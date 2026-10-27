@@ -7,7 +7,10 @@ then the script checks:
   2. the arm stays at its start pose (absolute joint actions are interpreted correctly);
   3. the fingers point along base +x and the palm faces -z (the new start pose);
   4. the cube rests on the table (z ~ 0.021 m, not moving) inside its 10 x 10 cm square,
-     and the squares of the resets are actually different (randomisation works).
+     and the squares of the resets are actually different (randomisation works);
+  5. the IL observation (51 numbers): every part equals the quantity it should contain
+     (arm and hand joint angles, arm velocities, cube position, log10 K: the envs alternate between
+     the two STIFFNESS_VALUES) and the fingertip forces are ~0 (the hand touches nothing).
 
     python scripts/tools/test_il_env.py                 # 4 envs, 3 resets, physics on the CPU
     python scripts/tools/test_il_env.py --headless
@@ -36,6 +39,7 @@ from tunable_comp_thesis.tasks.manager_based.lift_compliant.config.ur5_wuji.il_e
     ARM_JOINTS,
     CUBE_CENTER,
     CUBE_HALF_RANGE,
+    STIFFNESS_VALUES,
 )
 
 TASK = "Isaac-Lift-Cube-UR5Wuji-IL-v0"
@@ -50,6 +54,7 @@ def check(ok: bool, text: str) -> bool:
 
 def main():
     env_cfg = parse_env_cfg(TASK, device=args_cli.device, num_envs=args_cli.num_envs)
+    env_cfg.actions.hand_action.stiffness_values = list(STIFFNESS_VALUES)  # env i gets values[i % 2]
     env = gym.make(TASK, cfg=env_cfg)
     uw = env.unwrapped
     robot, cube = uw.scene["robot"], uw.scene["object"]
@@ -68,13 +73,25 @@ def main():
     q0 = robot.data.default_joint_pos
     hold = torch.cat([q0[:, arm_ids], q0[:, hand_ids]], dim=-1)
     print(f"[test] start angles of the arm [rad]: {[round(v, 3) for v in q0[0, arm_ids].tolist()]}")
+    om = uw.observation_manager
+    terms, dims = om.active_terms["policy"], om.group_obs_term_dim["policy"]
+    print(f"[test] observation terms: {list(zip(terms, [d[0] for d in dims]))}")
+    all_ok &= check(om.group_obs_dim["policy"] == (51,), f"observation size {om.group_obs_dim['policy']} == (51,)")
+    # where each term sits in the concatenated vector
+    sl, start = {}, 0
+    for t, d in zip(terms, dims):
+        sl[t] = slice(start, start + d[0])
+        start += d[0]
+    k_expected = torch.log10(torch.tensor([STIFFNESS_VALUES[i % len(STIFFNESS_VALUES)] for i in range(uw.num_envs)],
+                                          device=uw.device)).unsqueeze(-1)
 
     cube_xy = []
     with torch.inference_mode():
         for r in range(args_cli.resets):
             env.reset()
             for _ in range(steps):
-                env.step(hold)
+                obs, *_ = env.step(hold)
+            obs = obs["policy"]
             print(f"\n[test] reset {r + 1}/{args_cli.resets}, after holding {HOLD_S:.1f} s:")
 
             # 2. arm still at its start pose
@@ -102,6 +119,18 @@ def main():
             all_ok &= check(bool(((p[:, 2] - CUBE_REST).abs() < 2e-3).all()), f"cube at rest height ~{CUBE_REST} m")
             all_ok &= check(bool((v < 1e-2).all()), "cube not moving (< 1 cm/s)")
             cube_xy.append(p[:, :2].clone())
+
+            # 5. the observation: each part against the quantity it should contain
+            close = lambda a, b, tol=1e-4: bool((a - b).abs().max() < tol)  # noqa: E731
+            all_ok &= check(close(obs[:, sl["arm_joint_pos"]], robot.data.joint_pos[:, arm_ids]), "obs: arm joint angles")
+            all_ok &= check(close(obs[:, sl["arm_joint_vel"]], robot.data.joint_vel[:, arm_ids]), "obs: arm joint velocities")
+            all_ok &= check(close(obs[:, sl["hand_joint_pos"]], robot.data.joint_pos[:, hand_ids]),
+                            "obs: hand joint angles (in the hand action's order)")
+            f_max = obs[:, sl["fingertip_forces"]].abs().max().item()
+            all_ok &= check(f_max < 0.05, f"obs: fingertip forces ~0 with nothing touched (max {f_max:.3f} N)")
+            all_ok &= check(close(obs[:, sl["cube_position"]], p), "obs: cube position (base frame)")
+            all_ok &= check(close(obs[:, sl["stiffness"]], k_expected),
+                            f"obs: log10 K = {[round(v, 2) for v in obs[:, sl['stiffness']].flatten().tolist()]}")
 
     if len(cube_xy) > 1:
         spread = torch.stack(cube_xy).std(dim=0).mean().item()

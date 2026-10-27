@@ -109,6 +109,12 @@ class FingertipAdmittanceAction(JointPositionAction):
         return self._tip_forces
 
     @property
+    def tip_forces_filtered(self) -> torch.Tensor:
+        """The same forces as smoothed by the controller (EMA): what the admittance law acts on [N],
+        world frame, (N, 5, 3)."""
+        return self._controller.filtered_force
+
+    @property
     def tip_offsets(self) -> torch.Tensor:
         """Admittance offset e of each fingertip, world frame [m], (N, 5, 3)."""
         return self._controller.offset

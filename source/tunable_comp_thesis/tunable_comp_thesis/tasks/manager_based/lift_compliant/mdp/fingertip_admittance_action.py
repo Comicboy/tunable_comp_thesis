@@ -11,6 +11,12 @@ Isaac Lab's JointPositionAction. Every physics step this term then
   4. sends q_cmd = q_ref + dq to the joint drives.
 
 The stiffness K is fixed per environment for now (stiffness_values in the cfg).
+
+With admittance_enabled = False the law is bypassed: the action goes to the drives unchanged
+(q_cmd = q_ref, clamped to the joint limits), as for a policy that performs the admittance itself.
+The contact forces are still read and smoothed exactly as before, and the stiffness property still
+reports the configured K, so the observations (smoothed fingertip forces, log10 K) are the same as
+with the controller running.
 """
 
 from __future__ import annotations
@@ -157,8 +163,12 @@ class FingertipAdmittanceAction(JointPositionAction):
         f = self._contact_forces()  # (N, 5, 3)
         self._tip_forces[:] = f
 
-        # 2. admittance: how far each fingertip should yield
-        e = self._controller.compute(f, self._stiffness)  # (N, 5, 3)
+        # 2. admittance: how far each fingertip should yield. Bypassed: the controller still smooths
+        #    the force (the observation uses it), but with K = inf its offset stays 0
+        if self.cfg.admittance_enabled:
+            e = self._controller.compute(f, self._stiffness)  # (N, 5, 3)
+        else:
+            e = self._controller.compute(f, torch.full_like(self._stiffness, float("inf")))  # zeros
 
         # 3. fingertip offset -> joint offset, finger by finger
         jacobians = self._asset.root_physx_view.get_jacobians()  # (N, bodies, 6, dofs), world frame
@@ -242,3 +252,7 @@ class FingertipAdmittanceActionCfg(JointPositionActionCfg):
 
     ik_damping: float = 0.01
     """lambda of the damped pseudo-inverse [m]."""
+
+    admittance_enabled: bool = True
+    """False: bypass the admittance law (q_cmd = the action), for a policy that outputs q_cmd itself.
+    The force smoothing and the reported stiffness are unchanged, so the observations are too."""

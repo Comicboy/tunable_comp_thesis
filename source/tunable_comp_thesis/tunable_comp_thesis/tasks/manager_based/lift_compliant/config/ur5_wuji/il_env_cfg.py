@@ -13,8 +13,13 @@ Same scene and contact sensing as the lift task, with the choices made for imita
 * action, all absolute joint positions [rad], 26 numbers:
       arm  (6):  joint targets, in ARM_JOINTS order (the teleop script runs its own IK;
                  a policy outputs them directly)
-      hand (20): finger references q_ref of the FingertipAdmittanceAction (the admittance adds
-                 its offset on top), in the action term's joint order;
+      hand (20): finger joint commands q_cmd, sent to the drives as they are, in the hand action
+                 term's joint order;
+* the policy performs the fingertip admittance itself: by default the hand action term's admittance
+  law is bypassed (admittance_enabled = False), so its action goes to the drives unchanged, while the
+  term still smooths the contact forces and reports K for the observations. Only the teleoperation
+  (recording) switches the law on: there the operator sends references q_ref, the admittance turns
+  them into q_cmd = q_ref + J^+ e (e = f / K), and q_cmd is recorded as the action;
 * known friction (mu = 1) on the cube and the finger links, as in the scripted lift;
 * one stiffness K per environment for a whole episode (hand_action.stiffness_values, set by the
   script that creates the env);
@@ -144,7 +149,9 @@ class UR5WujiCubeLiftILEnvCfg(UR5WujiCubeLiftEnvCfg):
             scale=1.0,
             use_default_offset=False,  # action = target angle, not an offset from the start pose
         )
-        self.actions.hand_action.use_default_offset = False  # absolute q_ref, like the scripted lift
+        self.actions.hand_action.use_default_offset = False  # absolute joint positions, like the scripted lift
+        # the policy performs the admittance itself: the law is off unless a recording script turns it on
+        self.actions.hand_action.admittance_enabled = False
 
         # --- cube: at rest under the hand, randomised in a 10 x 10 cm square at every reset ------
         self.scene.object.init_state.pos = (CUBE_CENTER[0], CUBE_CENTER[1], CUBE_REST_Z)

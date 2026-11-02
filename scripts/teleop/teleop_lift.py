@@ -62,18 +62,31 @@ turns dark while the 3 s run). Only successful demos are kept:
     "d" + Enter                          -> deletes the last demo saved in this session
 
 One sample per env step (50 Hz): s_t = the IL state (51 numbers, ILPolicyCfg) the step started
-from, a_t = the 26 joint targets sent in that step, i.e. exactly what a policy will see and output.
+from, a_t = the 26 joint commands of that step: the arm targets and the finger commands q_cmd the
+admittance produced from the operator's q_ref, i.e. what a policy that performs the admittance
+itself sees and outputs.
 A demo whose real-time factor (simulated / wall time) is below --min_rtf is not saved: you moved at
 a slower pace than the simulated time suggests, which would distort the speeds in the data
 (claude/notes_imitation_learning.md, section 6).
 
-File layout (one file per stiffness, default logs/il_demos/lift_K<K>.hdf5; new demos are appended):
+File layout (one file per stiffness, default logs/il_demos/lift_K<K>.hdf5; new demos are appended;
+a file whose "format" attribute differs, e.g. demos recorded before q_cmd was the action, is refused):
 
-    /                     attrs: task, stiffness, controller, device, physics_dt, decimation, step_dt,
-                                 lp_alpha, IK settings, success condition, obs_terms (name, start,
-                                 end), arm_joints, hand_joints, created
+    /                     attrs: format, task, stiffness, controller, device, physics_dt, decimation,
+                                 step_dt, lp_alpha, IK settings, success condition, obs_terms (name,
+                                 start, end), arm_joints, hand_joints, created
     /data/demo_000/obs      (T, 51) float32
-    /data/demo_000/actions  (T, 26) float32   [arm, ARM_JOINTS order | hand q_ref, hand_joints order]
+    /data/demo_000/actions  (T, 26) float32   the training action: [arm targets, ARM_JOINTS order |
+                                              hand q_cmd, hand_joints order]. q_cmd = the command the
+                                              admittance sent to the finger drives in step t, q_ref +
+                                              J^+ e clamped to the joint limits (the last of the step's
+                                              2 physics steps): the policy performs the admittance itself
+    /data/demo_000/q_ref    (T, 20) float32   the operator's finger references (what the Quest sent;
+                                              the input of the admittance during recording)
+    /data/demo_000/dq       (T, 20) float32   the admittance part J^+ e = q_cmd - q_ref before clamping [rad]
+    /data/demo_000/tip_ref_offset (T, 5, 3)   J (q_ref - q) per fingertip [m] (reference penetration)
+    /data/demo_000/tip_force_raw  (T, 5, 3)   unsmoothed contact force from the cube per fingertip [N],
+                                              world frame (the state holds the smoothed one)
     /data/demo_000          attrs: num_samples, duration_s, wall_s, rtf, late_steps, idle_s (time from
                                    the reset to the clutch), recorded (date and time)
 
@@ -310,7 +323,7 @@ class DemoFile:
     run's (same stiffness, state and action sizes, step time); demos of different setups are not mixed.
     """
 
-    MUST_MATCH = ("task", "stiffness", "obs_dim", "action_dim", "step_dt")
+    MUST_MATCH = ("format", "task", "stiffness", "obs_dim", "action_dim", "step_dt")
 
     def __init__(self, path: str, attrs: dict):
         self.path = path
@@ -330,7 +343,7 @@ class DemoFile:
             self.count = len(f["data"])
         self.saved: list[str] = []  # demos saved in this session, for "d" (delete the last one)
 
-    def save(self, obs: np.ndarray, actions: np.ndarray, attrs: dict) -> str:
+    def save(self, obs: np.ndarray, actions: np.ndarray, attrs: dict, extra: dict | None = None) -> str:
         with h5py.File(self.path, "a") as f:
             data = f["data"]
             index = 1 + max((int(n.split("_")[1]) for n in data), default=-1)  # never reuse a name
@@ -338,6 +351,8 @@ class DemoFile:
             g = data.create_group(name)
             g.create_dataset("obs", data=obs.astype(np.float32))
             g.create_dataset("actions", data=actions.astype(np.float32))
+            for k, v in (extra or {}).items():  # q_cmd, dq, ...
+                g.create_dataset(k, data=v.astype(np.float32))
             for k, v in attrs.items():
                 g.attrs[k] = v
             self.count = len(data)
@@ -364,6 +379,9 @@ def main():
     env_cfg.actions.hand_action.controller = (
         AdmittanceControllerCfg() if args_cli.controller == "dynamic" else StaticAdmittanceControllerCfg()
     )
+    # teleoperation: the operator sends references q_ref, the admittance turns them into the joint
+    # commands q_cmd (the recorded action). The IL env has the law off by default (for the policy).
+    env_cfg.actions.hand_action.admittance_enabled = True
     env_cfg.viewer.origin_type = "asset_body"  # the camera follows the palm
     env_cfg.viewer.asset_name = "robot"
     env_cfg.viewer.body_name = PALM
@@ -433,8 +451,9 @@ def main():
             "obs_terms": json.dumps([[n, e - d, e] for n, d, e in zip(names, dims, ends)]),
             "arm_joints": json.dumps(ARM_JOINTS),
             "hand_joints": json.dumps(list(hand.joint_names)),
-            "action_layout": "[arm joint targets (arm_joints) | hand q_ref (hand_joints)], absolute, rad",
+            "action_layout": "[arm joint targets (arm_joints) | hand q_cmd (hand_joints)], absolute, rad",
             "created": datetime.datetime.now().isoformat(timespec="seconds"),
+            "format": "actions = [arm targets | hand q_cmd]; per demo also q_ref, dq, tip_ref_offset, tip_force_raw",
         }
         demos = DemoFile(path, attrs)
         print(f"[record] recording successful demos to {path} ({demos.count} already in it); "
@@ -536,15 +555,22 @@ def main():
 
             # --- recording: starts at the first live step after a reset, i.e. at the release -------
             if demos is not None and rec is None and live:
-                rec = {"obs": [], "act": [], "t0": time.perf_counter(), "late0": late, "idle_s": episode_step * dt}
+                rec = {"obs": [], "act": [], "q_ref": [], "dq": [], "tip_ref_offset": [], "tip_force_raw": [],
+                       "t0": time.perf_counter(), "late0": late, "idle_s": episode_step * dt}
                 print(f"[record] demo started (clutch engaged after {rec['idle_s']:.1f} s)")
             if rec is not None:
                 rec["obs"].append(obs[0].cpu().numpy().copy())  # s_t: the state this step starts from
-                rec["act"].append(action[0].cpu().numpy().copy())  # a_t: the targets sent in this step
+                rec["q_ref"].append(q_ref[0].cpu().numpy().copy())  # the operator's finger references
 
             # --- env step ------------------------------------------------------------------------
             obs, _, terminated, truncated, _ = env.step(action)
             obs = obs["policy"]
+            if rec is not None:  # what the admittance did in this step (these buffers survive an env reset)
+                # a_t = [arm targets sent | finger command the admittance produced in this step]
+                rec["act"].append(np.concatenate([q_arm[0].cpu().numpy(), hand.joint_command[0].cpu().numpy()]))
+                rec["dq"].append(hand.joint_offsets[0].cpu().numpy().copy())
+                rec["tip_ref_offset"].append(hand.tip_reference_offsets[0].cpu().numpy().copy())
+                rec["tip_force_raw"].append(hand.tip_forces[0].cpu().numpy().copy())
             step += 1
             episode_step += 1
             # fingertip contact with anything but the cube (table, other fingers): net force minus cube force
@@ -569,7 +595,7 @@ def main():
                                 "late_steps": late - rec["late0"],
                                 "idle_s": rec["idle_s"],
                                 "recorded": datetime.datetime.now().isoformat(timespec="seconds"),
-                            })
+                            }, extra={k_: np.stack(rec[k_]) for k_ in ("q_ref", "dq", "tip_ref_offset", "tip_force_raw")})
                             print(f"[record] saved {name}: {n} samples, {n * dt:.1f} s, x{rtf:.2f} real time "
                                   f"-> {demos.count} demos in {demos.path}")
                         rec = None

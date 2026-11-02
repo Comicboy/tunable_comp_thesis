@@ -12,7 +12,9 @@ What goes where (decided 2026-10-31). Our 51-number state is split by its terms 
     observation.state              (48)  arm q (6), arm q_dot (6), hand q (20), fingertip forces (15),
                                          log10 K (1), in this order
     observation.environment_state  (3)   cube position (base frame)
-    action                         (26)  [arm joint targets (6) | hand q_ref (20)], absolute [rad]
+    action                         (26)  [arm joint targets (6) | finger joint commands q_cmd (20)], absolute [rad]
+                                         (q_cmd = what the admittance sent to the drives while recording: the
+                                         policy learns to perform the admittance itself)
 
 LeRobot's ACT turns each of the two observation groups into one transformer token, and it needs an
 environment state when there are no camera images. The stiffness is part of the robot's state: it
@@ -48,7 +50,7 @@ parser.add_argument("--overwrite", action="store_true", help="delete --root firs
 args = parser.parse_args()
 
 ENV_TERMS = ("cube_position",)  # -> observation.environment_state; every other term -> observation.state
-MUST_MATCH = ("task", "obs_dim", "action_dim", "step_dt", "obs_terms", "arm_joints", "hand_joints")
+MUST_MATCH = ("task", "obs_dim", "action_dim", "step_dt", "obs_terms", "arm_joints", "hand_joints", "format")
 
 
 def term_names(term: str, size: int, attrs: dict) -> list[str]:
@@ -77,9 +79,10 @@ def main():
             metas.append(dict(f.attrs))
     for path, m in zip(args.files[1:], metas[1:]):
         for k in MUST_MATCH:
-            same = np.isclose(m[k], metas[0][k]) if isinstance(m[k], float) else m[k] == metas[0][k]
+            mk, m0 = m.get(k), metas[0].get(k)
+            same = np.isclose(mk, m0) if isinstance(mk, float) and isinstance(m0, float) else mk == m0
             if not same:
-                raise SystemExit(f"{path}: {k} = {m[k]} differs from {args.files[0]} ({metas[0][k]})")
+                raise SystemExit(f"{path}: {k} = {mk} differs from {args.files[0]} ({m0})")
     a0 = metas[0]
     fps = int(round(1.0 / float(a0["step_dt"])))
 
@@ -94,12 +97,14 @@ def main():
         else:
             state_idx += idx
             state_names += names
+    if "q_cmd" not in str(a0.get("format", "")):
+        raise SystemExit(f"{args.files[0]}: not a demo file with q_cmd as the action (recorded before that change?)")
     action_names = [f"{j}.target" for j in json.loads(a0["arm_joints"])] + \
-                   [f"{j}.q_ref" for j in json.loads(a0["hand_joints"])]
+                   [f"{j}.q_cmd" for j in json.loads(a0["hand_joints"])]
     assert len(state_idx) + len(env_idx) == int(a0["obs_dim"]) and len(action_names) == int(a0["action_dim"])
     print(f"[convert] observation.state: {len(state_idx)} numbers ({', '.join(t[0] for t in terms if t[0] not in ENV_TERMS)})")
     print(f"[convert] observation.environment_state: {len(env_idx)} numbers ({', '.join(ENV_TERMS)})")
-    print(f"[convert] action: {len(action_names)} numbers, {fps} fps")
+    print(f"[convert] action: {len(action_names)} numbers (arm targets | finger commands q_cmd), {fps} fps")
 
     features = {
         "observation.state": {"dtype": "float32", "shape": (len(state_idx),), "names": state_names},

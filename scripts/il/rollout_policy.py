@@ -4,16 +4,18 @@ Runs in the Isaac Lab env. The policy itself runs in scripts/il/policy_server.py
 script sends it the state every env step and applies the action it returns. Start the server first:
 
     # terminal 1, conda env "lerobot"
-    python scripts/il/policy_server.py --policy logs/il_train/act_v1/checkpoints/last/pretrained_model
+    python scripts/il/policy_server.py --policy logs/il_train/<run>/checkpoints/last/pretrained_model
 
     # terminal 2, conda env "env_isaaclab", repo root
-    python scripts/il/rollout_policy.py --stiffness 150 --episodes 20 --tag act_v1
-    python scripts/il/rollout_policy.py --stiffness 500 --episodes 20 --tag act_v1
-    python scripts/il/rollout_policy.py --stiffness 150 --episodes 20 --tag act_v1 --headless   # faster, no window
+    python scripts/il/rollout_policy.py --stiffness 150 --episodes 20 --tag <run>
+    python scripts/il/rollout_policy.py --stiffness 500 --episodes 20 --tag <run>
+    python scripts/il/rollout_policy.py --stiffness 150 --episodes 20 --tag <run> --headless   # faster, no window
 
-Same env and settings as the demos: Isaac-Lift-Cube-UR5Wuji-IL-v0, physics on the CPU, one env, the
-dynamic admittance controller, one stiffness K for the whole run (as in the recordings, one file per
-K). The cube start positions are drawn by this script from --seed (uniform in the env's 10 x 10 cm
+Same env and settings as the demos: Isaac-Lift-Cube-UR5Wuji-IL-v0, physics on the CPU, one env, one
+stiffness K for the whole run (as in the recordings, one file per K). The policy performs the
+fingertip admittance itself: the env's admittance law is off (its default), so the policy's finger
+commands go to the drives unchanged; the env still smooths the contact forces for the state and
+reports --stiffness as the K the policy is asked to behave with. The cube start positions are drawn by this script from --seed (uniform in the env's 10 x 10 cm
 spawn square) and the cube is placed there at every episode start, so runs with the same seed see the
 same position in episode i, whatever K or policy. (Relying on the env's own reset randomisation did
 not give that: the env's random numbers are also used during an episode, e.g. by the lift task's
@@ -23,7 +25,7 @@ had lasted.) --only runs selected episodes of that list, e.g. to watch failures 
 Every env step (50 Hz):
     state     = the IL state (51 numbers) split as in the dataset: cube position -> environment_state
                 (3), everything else -> state (48), in the same order as scripts/il/convert_to_lerobot.py
-    action    = the server's reply (26 absolute joint targets [arm | hand q_ref]) -> env.step
+    action    = the server's reply (26 absolute joint commands [arm targets | finger commands q_cmd]) -> env.step
 Each episode starts with --settle_s (1 s) of holding the start pose (the cube settles; in the demos
 the robot also stood still before the clutch was released), then the policy takes over.
 An episode ends as in the demos: success (cube bottom >= 15 cm above the table for 3 s, the env's
@@ -35,6 +37,12 @@ Results: one line per episode, a summary (success rate, time to success), and a 
 by the server, plus _only<episodes> for --only runs; an existing full-run file is not overwritten
 without --overwrite, --only runs are) with the settings, the
 server's info and every episode.
+
+Trajectories: next to the JSON file, <same name>.hdf5 holds every episode's states and actions in the
+layout of the demo files (/data/ep_NNN/obs (T, 51) = the state each step started from, /actions
+(T, 26) = the action sent in it; attrs outcome, success, duration_s; file attrs stiffness, step_dt,
+obs_terms, joint names, success condition, server info), so the rollouts can be compared with the
+demos by the same code (scripts/il/plot_stiffness_behaviour.py). --no_traj switches this off.
 """
 
 import argparse
@@ -59,6 +67,7 @@ parser.add_argument("--out", default=None,
                          "<inference> = n<n_action_steps> or te<coeff>, from the server)")
 parser.add_argument("--overwrite", action="store_true", help="replace an existing results file")
 parser.add_argument("--realtime", action="store_true", help="pace the sim to real time (for watching)")
+parser.add_argument("--no_traj", action="store_true", help="do not save the states and actions (.hdf5)")
 parser.add_argument("--cam_eye", type=float, nargs=3, default=[-0.25, 0.12, 0.20],
                     help="camera position relative to the palm [m] (default: the view used for the recordings)")
 parser.add_argument("--cam_lookat", type=float, nargs=3, default=[0.20, 0.0, -0.10],
@@ -77,6 +86,7 @@ import socket
 import time
 
 import gymnasium as gym
+import h5py
 import numpy as np
 import torch
 
@@ -130,7 +140,10 @@ def main():
     env_cfg = parse_env_cfg(TASK, device=args_cli.device, num_envs=1)
     env_cfg.seed = args_cli.seed
     env_cfg.actions.hand_action.stiffness_values = [args_cli.stiffness]
-    env_cfg.actions.hand_action.controller = AdmittanceControllerCfg()  # the dynamic controller, as in the demos
+    # admittance law off (the IL env's default): the policy's finger commands go to the drives as they are;
+    # the controller cfg only sets the force smoothing for the state, as in the recordings
+    env_cfg.actions.hand_action.controller = AdmittanceControllerCfg()
+    assert not env_cfg.actions.hand_action.admittance_enabled, "the IL env should have the admittance law off"
     env_cfg.episode_length_s = args_cli.episode_s
     env_cfg.viewer.origin_type = "asset_body"  # the camera follows the palm
     env_cfg.viewer.asset_name = "robot"
@@ -191,6 +204,30 @@ def main():
     got = (info["state_dim"], info["env_state_dim"], info["action_dim"])
     if expected != got:
         raise SystemExit(f"[rollout] sizes (state, env_state, action) differ: env {expected}, policy {got}")
+    # trajectories (same layout as the demo files), written after every episode
+    traj = None if args_cli.no_traj else os.path.splitext(out)[0] + ".hdf5"
+    if traj is not None:
+        os.makedirs(os.path.dirname(os.path.abspath(traj)), exist_ok=True)
+        ends = np.cumsum(dims).tolist()
+        with h5py.File(traj, "w") as f:
+            f.create_group("data")
+            f.attrs.update({
+                "source": "policy rollout",
+                "task": TASK,
+                "stiffness": float(args_cli.stiffness),
+                "step_dt": float(dt),
+                "seed": int(args_cli.seed),
+                "obs_dim": int(sum(dims)),
+                "action_dim": int(uw.action_manager.total_action_dim),
+                "obs_terms": json.dumps([[n, e - d, e] for n, d, e in zip(names, dims, ends)]),
+                "arm_joints": json.dumps(ARM_JOINTS),
+                "hand_joints": json.dumps(list(hand.joint_names)),
+                "success": json.dumps({k: v for k, v in success_cfg.params.items()
+                                       if k in ("height", "half_size", "hold_s", "tolerance")}),
+                "server": json.dumps(info),
+                "created": datetime.datetime.now().isoformat(timespec="seconds"),
+            })
+
     print(f"[rollout] {len(episodes)} episodes at K = {args_cli.stiffness:g} N/m, seed {args_cli.seed}, "
           f"time limit {args_cli.episode_s:g} s (incl. {args_cli.settle_s:g} s settling), device {uw.device}\n")
 
@@ -205,6 +242,7 @@ def main():
             o = obs["policy"][0].cpu().numpy()
             cube0 = o[env_idx].tolist()
             max_lift, steps, replans, infer_ms = 0.0, 0, 0, []
+            obs_log, act_log = [], []
             t_wall = time.perf_counter()
             while True:
                 o = obs["policy"][0].cpu().numpy().astype(float)
@@ -212,6 +250,8 @@ def main():
                 replans += int(rep["replanned"])
                 infer_ms.append(rep["infer_ms"])
                 action = torch.tensor([rep["action"]], dtype=torch.float, device=uw.device)
+                obs_log.append(o.astype(np.float32))  # s_t: the state this step starts from
+                act_log.append(np.asarray(rep["action"], dtype=np.float32))  # a_t
                 obs, _, terminated, truncated, _ = env.step(action)
                 steps += 1
                 if not (bool(terminated[0]) or bool(truncated[0])):  # after an ending, obs is already the next episode's
@@ -241,6 +281,13 @@ def main():
                 "wall_s": time.perf_counter() - t_wall,
             }
             results.append(r)
+            if traj is not None:
+                with h5py.File(traj, "a") as f:
+                    g = f["data"].create_group(f"ep_{ep:03d}")
+                    g.create_dataset("obs", data=np.stack(obs_log))
+                    g.create_dataset("actions", data=np.stack(act_log))
+                    g.attrs.update({"episode": ep, "outcome": outcome, "success": outcome == "success",
+                                    "duration_s": steps * dt})
             print(f"[rollout] episode {ep:3d}: {outcome:<18} {r['duration_s']:5.1f} s | cube start "
                   f"({cube0[0]:+.3f}, {cube0[1]:+.3f}) | max lift {100 * max_lift:5.1f} cm "
                   f"(target {100 * height:.0f}) | replans {replans}")
@@ -280,7 +327,7 @@ def main():
             "created": datetime.datetime.now().isoformat(timespec="seconds"),
             "episodes": results,
         }, fh, indent=1)
-    print(f"[rollout] results -> {out}")
+    print(f"[rollout] results -> {out}" + (f", trajectories -> {traj}" if traj else ""))
     env.close()
 
 

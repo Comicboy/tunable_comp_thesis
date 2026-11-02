@@ -1,8 +1,8 @@
 """Full teleoperation of the IL env: the Quest 3 drives the arm (wrist) and the hand (fingers).
 
-Second teleop step, on Isaac-Lift-Cube-UR5Wuji-IL-v0 (fingers-forward start pose, cube randomised
-under the hand, all actions absolute joint positions). Nothing is recorded yet; this is for
-practising the lift and checking the arm mapping. Recording is added to this script later.
+Runs on Isaac-Lift-Cube-UR5Wuji-IL-v0 (fingers-forward start pose, cube randomised in front of the
+hand, all actions absolute joint positions). Without --record it is for practising; with --record
+it saves the successful demos to an HDF5 file (see "Recording" below).
 
 Data path (as for teleop_hand.py):
 
@@ -41,11 +41,43 @@ Run (two terminals):
     python scripts/teleop/teleop_lift.py                     # admittance off (K = inf)
     python scripts/teleop/teleop_lift.py --stiffness 150     # with the admittance
     python scripts/teleop/teleop_lift.py --no_rotation       # hand keeps its orientation (position only)
+    python scripts/teleop/teleop_lift.py --stiffness 150 --record    # record demos at K = 150
 
 Operating it: stand as if behind the robot (looking along its +x). Right hand: wrist moves the hand,
 fingers move the fingers. LEFT-hand pinch freezes everything: move your own arm back to a comfortable
 place, release, carry on (the robot continues from where it is). In this terminal: "r" + Enter resets
-the episode (new cube position), "q" + Enter quits.
+the episode (new cube position), "d" + Enter deletes the last saved demo, "q" + Enter quits.
+
+Start of an episode: after every reset (and at the start) the robot holds its start pose until you
+pinch with the left hand and release; the episode starts at the release (status line: "pinch +
+release to start"). So you can put your hands in a comfortable place first.
+
+Recording (--record): a demo starts at that release. From then on every env step is stored, including later freezes (the
+robot then holds still, which ends up in the demo as a pause; so avoid re-clutching during a demo).
+The episode ends by itself on success (cube bottom >= 15 cm above the table for 3 s; the green grid
+turns dark while the 3 s run). Only successful demos are kept:
+
+    success                              -> saved (unless the run was slower than real time, see below)
+    "r" reset, time limit, cube dropped  -> discarded
+    "d" + Enter                          -> deletes the last demo saved in this session
+
+One sample per env step (50 Hz): s_t = the IL state (51 numbers, ILPolicyCfg) the step started
+from, a_t = the 26 joint targets sent in that step, i.e. exactly what a policy will see and output.
+A demo whose real-time factor (simulated / wall time) is below --min_rtf is not saved: you moved at
+a slower pace than the simulated time suggests, which would distort the speeds in the data
+(claude/notes_imitation_learning.md, section 6).
+
+File layout (one file per stiffness, default logs/il_demos/lift_K<K>.hdf5; new demos are appended):
+
+    /                     attrs: task, stiffness, controller, device, physics_dt, decimation, step_dt,
+                                 lp_alpha, IK settings, success condition, obs_terms (name, start,
+                                 end), arm_joints, hand_joints, created
+    /data/demo_000/obs      (T, 51) float32
+    /data/demo_000/actions  (T, 26) float32   [arm, ARM_JOINTS order | hand q_ref, hand_joints order]
+    /data/demo_000          attrs: num_samples, duration_s, wall_s, rtf, late_steps, idle_s (time from
+                                   the reset to the clutch), recorded (date and time)
+
+Check a file with scripts/tools/inspect_demos.py.
 
 Status line (once a second): besides position, cube height and forces it shows why the arm may
 not follow your hand (which feels like lag): the largest IK error of the last second, how often a
@@ -72,13 +104,20 @@ parser.add_argument("--ik_point", choices=["wrist", "grasp"], default="wrist",
 parser.add_argument("--max_joint_step", type=float, default=0.05,
                     help="largest arm joint change per env step [rad] (0.05 = 2.5 rad/s); guards against IK jumps")
 parser.add_argument("--ik_damping", type=float, default=0.05, help="lambda of the damped least-squares IK")
-parser.add_argument("--cam_eye", type=float, nargs=3, default=[0.30, -0.45, 0.25],
+parser.add_argument("--cam_eye", type=float, nargs=3, default=[0.30, 0.45, 0.25],
                     help="camera position relative to the palm [m] (the camera follows the palm)")
 parser.add_argument("--cam_lookat", type=float, nargs=3, default=[0.05, 0.0, -0.10],
                     help="point the camera looks at, relative to the palm [m]")
 parser.add_argument("--episode_s", type=float, default=300.0,
                     help="time limit of an episode [s] (the env's default is 60 s; longer for practising)")
 parser.add_argument("--print_every", type=int, default=50, help="status line every N env steps (50 = 1 s)")
+parser.add_argument("--record", action="store_true", help="save successful demos to --dataset")
+parser.add_argument("--dataset", default=None,
+                    help="HDF5 file for the demos (default logs/il_demos/lift_K<stiffness>.hdf5); appended to")
+parser.add_argument("--min_rtf", type=float, default=0.95,
+                    help="demos recorded slower than this real-time factor are not saved")
+parser.add_argument("--lp_alpha", type=float, default=0.2,
+                    help="the bridge's finger filter (stream_joints.py --lp-alpha); only stored in the file")
 AppLauncher.add_app_launcher_args(parser)
 parser.set_defaults(device="cpu")  # one env: CPU physics is much faster than the GPU
 args_cli = parser.parse_args()
@@ -87,7 +126,9 @@ args_cli.kit_args = f"{args_cli.kit_args or ''} {FRAME_LIMIT_OFF}".strip()
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
+import datetime
 import json
+import os
 import queue
 import socket
 import sys
@@ -95,6 +136,8 @@ import threading
 import time
 
 import gymnasium as gym
+import h5py
+import numpy as np
 import torch
 
 from isaaclab.utils.math import (
@@ -110,7 +153,11 @@ from isaaclab_tasks.utils import parse_env_cfg
 
 import tunable_comp_thesis.tasks  # noqa: F401  (registers the gym tasks)
 from tunable_comp_thesis.controllers import AdmittanceControllerCfg, StaticAdmittanceControllerCfg
-from tunable_comp_thesis.tasks.manager_based.lift_compliant.config.ur5_wuji.il_env_cfg import ARM_JOINTS, EE_OFFSET
+from tunable_comp_thesis.tasks.manager_based.lift_compliant.config.ur5_wuji.il_env_cfg import (
+    ARM_JOINTS,
+    EE_OFFSET,
+    STIFFNESS_VALUES,
+)
 
 TASK = "Isaac-Lift-Cube-UR5Wuji-IL-v0"
 STALE_S = 0.3  # [s] a packet older than this counts as "no stream"
@@ -252,6 +299,62 @@ def rotvec_to_quat(rv: torch.Tensor) -> torch.Tensor:
 
 
 # ------------------------------------------------------------------------------------------------
+# recording: one HDF5 file, one group per successful demo
+# ------------------------------------------------------------------------------------------------
+
+class DemoFile:
+    """Appends demos to an HDF5 file (layout in the module docstring).
+
+    The file is opened only to write or delete a demo and closed straight after, so a crash or a
+    killed process never leaves it half-written. If the file exists, its settings must match this
+    run's (same stiffness, state and action sizes, step time); demos of different setups are not mixed.
+    """
+
+    MUST_MATCH = ("task", "stiffness", "obs_dim", "action_dim", "step_dt")
+
+    def __init__(self, path: str, attrs: dict):
+        self.path = path
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        with h5py.File(path, "a") as f:
+            if "data" not in f:  # new file
+                f.create_group("data")
+                for k, v in attrs.items():
+                    f.attrs[k] = v
+            else:
+                for k in self.MUST_MATCH:
+                    old, new = f.attrs.get(k), attrs[k]
+                    same = np.isclose(old, new) if isinstance(new, float) else old == new
+                    if not same:
+                        raise SystemExit(f"[record] {path} was recorded with {k} = {old}, this run has {new}. "
+                                         "Use another --dataset.")
+            self.count = len(f["data"])
+        self.saved: list[str] = []  # demos saved in this session, for "d" (delete the last one)
+
+    def save(self, obs: np.ndarray, actions: np.ndarray, attrs: dict) -> str:
+        with h5py.File(self.path, "a") as f:
+            data = f["data"]
+            index = 1 + max((int(n.split("_")[1]) for n in data), default=-1)  # never reuse a name
+            name = f"demo_{index:03d}"
+            g = data.create_group(name)
+            g.create_dataset("obs", data=obs.astype(np.float32))
+            g.create_dataset("actions", data=actions.astype(np.float32))
+            for k, v in attrs.items():
+                g.attrs[k] = v
+            self.count = len(data)
+        self.saved.append(name)  # (h5py objects such as g are invalid once the file is closed)
+        return name
+
+    def delete_last(self) -> str | None:
+        if not self.saved:
+            return None
+        name = self.saved.pop()
+        with h5py.File(self.path, "a") as f:
+            del f["data"][name]
+            self.count = len(f["data"])
+        return name
+
+
+# ------------------------------------------------------------------------------------------------
 # main
 # ------------------------------------------------------------------------------------------------
 
@@ -273,6 +376,9 @@ def main():
     robot, cube = uw.scene["robot"], uw.scene["object"]
     hand = uw.action_manager.get_term("hand_action")
     dev, dt = uw.device, uw.step_dt
+    success_cfg = uw.termination_manager.get_term_cfg("success")
+    success_term = success_cfg.func  # CubeHeldAboveHeight: hold timer for the status line
+    hold_s = success_cfg.params["hold_s"]
 
     arm_ids = robot.find_joints(ARM_JOINTS, preserve_order=True)[0]
     hand_ids = robot.find_joints(hand.joint_names, preserve_order=True)[0]
@@ -287,7 +393,8 @@ def main():
         q0 = robot.data.default_joint_pos
         return q0[:, arm_ids].clone(), q0[:, hand_ids].clone()
 
-    env.reset()
+    obs, _ = env.reset()
+    obs = obs["policy"]  # (1, 51): the IL state
     q_arm, q_ref = start_targets()
     p0, R0 = grasp.pose()
     k_name = "inf (admittance off)" if math.isinf(args_cli.stiffness) else f"{args_cli.stiffness:g} N/m"
@@ -298,12 +405,60 @@ def main():
           f"episodes end after {args_cli.episode_s:g} s")
     tip_sensor = uw.scene["fingertip_contacts"]  # unfiltered: everything touching the fingertips
 
+    # --- recording setup ---------------------------------------------------------------------------
+    demos: DemoFile | None = None
+    if args_cli.record:
+        if args_cli.stiffness not in STIFFNESS_VALUES:
+            print(f"[record] WARNING: K = {args_cli.stiffness:g} is not one of the demo stiffnesses {STIFFNESS_VALUES}")
+        path = args_cli.dataset or os.path.join("logs", "il_demos", f"lift_K{args_cli.stiffness:g}.hdf5")
+        om = uw.observation_manager
+        names, dims = om.active_terms["policy"], [d[0] for d in om.group_obs_term_dim["policy"]]
+        ends = np.cumsum(dims).tolist()
+        attrs = {
+            "task": TASK,
+            "stiffness": float(args_cli.stiffness),
+            "controller": args_cli.controller,
+            "device": str(dev),
+            "physics_dt": float(uw.physics_dt),
+            "decimation": int(uw.cfg.decimation),
+            "step_dt": float(dt),
+            "lp_alpha": float(args_cli.lp_alpha),
+            "ik_point": args_cli.ik_point,
+            "ik_damping": float(args_cli.ik_damping),
+            "max_joint_step": float(args_cli.max_joint_step),
+            "no_rotation": bool(args_cli.no_rotation),
+            "success": json.dumps({k: v for k, v in success_cfg.params.items() if k in ("height", "half_size", "hold_s", "tolerance")}),
+            "obs_dim": int(sum(dims)),
+            "action_dim": int(uw.action_manager.total_action_dim),
+            "obs_terms": json.dumps([[n, e - d, e] for n, d, e in zip(names, dims, ends)]),
+            "arm_joints": json.dumps(ARM_JOINTS),
+            "hand_joints": json.dumps(list(hand.joint_names)),
+            "action_layout": "[arm joint targets (arm_joints) | hand q_ref (hand_joints)], absolute, rad",
+            "created": datetime.datetime.now().isoformat(timespec="seconds"),
+        }
+        demos = DemoFile(path, attrs)
+        print(f"[record] recording successful demos to {path} ({demos.count} already in it); "
+              f"a demo starts when the clutch engages, demos below x{args_cli.min_rtf} real time are not saved")
+
+    rec: dict | None = None  # the demo being recorded: lists of obs and actions, start times
+    episode_step = 0  # env steps since the last reset (for the idle time before the clutch)
+
+    def discard(why: str):
+        nonlocal rec
+        if rec is not None:
+            print(f"[record] demo discarded ({why}, {len(rec['obs']) * dt:.1f} s)")
+        rec = None
+
     rx = QuestReceiver(args_cli.udp)
     cmds = stdin_commands()
-    print(f"[teleop] listening on {args_cli.udp}; type r + Enter = reset episode, q + Enter = quit\n")
+    print(f"[teleop] listening on {args_cli.udp}; type r + Enter = reset episode, "
+          f"{'d + Enter = delete the last saved demo, ' if demos else ''}q + Enter = quit\n")
 
     anchor: tuple[torch.Tensor, torch.Tensor] | None = None  # grasp pose when the clutch engaged
     was_live, step, count_prev, late = False, 0, 0, 0
+    # start gate: after every reset (and at the start) the robot holds its start pose until the
+    # operator pinches and releases, so every episode (and demo) starts from a fresh clutch engagement
+    wait_clutch, seen_pinch = True, False
     pos_err = rot_err = 0.0
     # per status interval: why the arm may not follow (shown as "lag" to the operator)
     diag = {"live": 0, "limited": 0, "pos": 0.0, "rot": 0.0, "other": 0.0}
@@ -316,17 +471,25 @@ def main():
             while not cmds.empty():
                 c = cmds.get()
                 if c == "q":
+                    discard("quit")
                     print("[teleop] quit")
                     rx.close()
                     env.close()
                     return
                 if c == "r":
                     reset_now = True
+                if c == "d" and demos is not None:
+                    name = demos.delete_last()
+                    print(f"[record] deleted {name}, {demos.count} demos in the file" if name
+                          else "[record] nothing to delete (no demo saved in this session)")
             if reset_now:
-                env.reset()
+                discard("reset")
+                obs, _ = env.reset()
+                obs = obs["policy"]
                 q_arm, q_ref = start_targets()
-                anchor, was_live = None, False
-                print("[teleop] episode reset (new cube position)")
+                anchor, was_live, episode_step = None, False, 0
+                wait_clutch, seen_pinch = True, False
+                print("[teleop] episode reset (new cube position): pinch + release to start")
 
             # --- what the operator does this step ------------------------------------------------
             packet = rx.poll()
@@ -340,6 +503,18 @@ def main():
                 live, reason = False, "no hand_q (stream_joints.py without --hand-repo?)"
             else:
                 live, reason = True, ""
+
+            # start gate: ignore the stream until a pinch (a fresh packet with the clutch off) has
+            # been followed by a release; the bridge re-anchors at the release, so ee_delta starts at 0
+            if wait_clutch:
+                if live and seen_pinch:
+                    wait_clutch = False  # released after a pinch: go (this step is the first live one)
+                else:
+                    if packet is not None and rx.age <= STALE_S and not packet.get("clutch", False):
+                        seen_pinch = True
+                    if packet is not None and rx.age <= STALE_S:  # keep the stream problems' reasons
+                        reason = "pinching: release to start" if seen_pinch else "pinch + release to start"
+                    live = False
 
             if live:
                 # the bridge re-anchors whenever its clutch engages; re-anchor here at the same moment
@@ -357,17 +532,55 @@ def main():
                 q_ref = torch.tensor(packet["hand_q"], dtype=torch.float, device=dev)[perm].unsqueeze(0)
             # not live: q_arm and q_ref keep their last values (hold, do not snap anywhere)
             was_live = live
+            action = torch.cat([q_arm, q_ref], dim=-1)  # 26 absolute joint positions [arm | hand]
 
-            # --- env step: 26 absolute joint positions [arm | hand] -----------------------------
-            _, _, terminated, truncated, _ = env.step(torch.cat([q_arm, q_ref], dim=-1))
+            # --- recording: starts at the first live step after a reset, i.e. at the release -------
+            if demos is not None and rec is None and live:
+                rec = {"obs": [], "act": [], "t0": time.perf_counter(), "late0": late, "idle_s": episode_step * dt}
+                print(f"[record] demo started (clutch engaged after {rec['idle_s']:.1f} s)")
+            if rec is not None:
+                rec["obs"].append(obs[0].cpu().numpy().copy())  # s_t: the state this step starts from
+                rec["act"].append(action[0].cpu().numpy().copy())  # a_t: the targets sent in this step
+
+            # --- env step ------------------------------------------------------------------------
+            obs, _, terminated, truncated, _ = env.step(action)
+            obs = obs["policy"]
             step += 1
+            episode_step += 1
             # fingertip contact with anything but the cube (table, other fingers): net force minus cube force
             net = tip_sensor.data.net_forces_w[0, hand._sensor_rows]  # (5, 3), finger1..5
             diag["other"] = max(diag["other"], (net - hand.tip_forces[0]).norm(dim=-1).sum().item())
-            if bool(terminated[0]) or bool(truncated[0]):  # time limit or cube off the table: env has reset
+            if bool(terminated[0]) or bool(truncated[0]):  # the env has reset itself; obs is the new episode's
+                success = bool(terminated[0]) and bool(uw.termination_manager.get_term("success")[0])
+                if success:
+                    print(f"[teleop] SUCCESS: cube held above the target for {hold_s:g} s")
+                    if rec is not None:
+                        n = len(rec["obs"])
+                        wall = time.perf_counter() - rec["t0"]
+                        rtf = n * dt / max(wall, 1e-6)
+                        if rtf < args_cli.min_rtf:
+                            print(f"[record] demo NOT saved: ran at x{rtf:.2f} real time (< {args_cli.min_rtf})")
+                        else:
+                            name = demos.save(np.stack(rec["obs"]), np.stack(rec["act"]), {
+                                "num_samples": n,
+                                "duration_s": n * dt,
+                                "wall_s": wall,
+                                "rtf": rtf,
+                                "late_steps": late - rec["late0"],
+                                "idle_s": rec["idle_s"],
+                                "recorded": datetime.datetime.now().isoformat(timespec="seconds"),
+                            })
+                            print(f"[record] saved {name}: {n} samples, {n * dt:.1f} s, x{rtf:.2f} real time "
+                                  f"-> {demos.count} demos in {demos.path}")
+                        rec = None
+                else:
+                    why = "time limit" if bool(truncated[0]) else "cube off the table"
+                    discard(why)
+                    print(f"[teleop] episode ended by the env ({why}), reset")
                 q_arm, q_ref = start_targets()
-                anchor, was_live = None, False
-                print("[teleop] episode ended by the env (time limit or cube off the table), reset")
+                anchor, was_live, episode_step = None, False, 0
+                wait_clutch, seen_pinch = True, False
+                print("[teleop] pinch + release to start the next episode")
 
             # --- status line, about once a second ------------------------------------------------
             if args_cli.print_every and step % args_cli.print_every == 0:
@@ -381,10 +594,14 @@ def main():
                 state = "LIVE" if live else f"held: {reason}"
                 limited = 100 * diag["limited"] / max(diag["live"], 1)
                 at_limit = [ARM_JOINTS[k].replace("_joint", "") for k in torch.nonzero(limit_hits).flatten().tolist()]
-                print(f"[{step * dt:7.1f} s] {state:<34.34} | grasp pt {' '.join(f'{v:+.3f}' for v in p[0].tolist())} m"
+                hold = f" | hold {success_term.hold_time[0].item():3.1f}/{hold_s:g} s" if bool(success_term.above[0]) else ""
+                rec_state = ""
+                if demos is not None:
+                    rec_state = f"REC {len(rec['obs']) * dt:5.1f} s | " if rec is not None else "rec: wait clutch | "
+                print(f"[{step * dt:7.1f} s] {rec_state}{state:<34.34} | grasp pt {' '.join(f'{v:+.3f}' for v in p[0].tolist())} m"
                       f" | IK err max {1000 * diag['pos']:4.0f} mm {math.degrees(diag['rot']):5.1f} deg, "
                       f"step-limited {limited:3.0f} %{', at limit: ' + ' '.join(at_limit) if at_limit else ''}"
-                      f" | cube lifted {100 * (cube_p[0, 2].item() - CUBE_REST):5.1f} cm | sum|f| cube {f_sum:4.1f} N,"
+                      f" | cube lifted {100 * (cube_p[0, 2].item() - CUBE_REST):5.1f} cm{hold} | sum|f| cube {f_sum:4.1f} N,"
                       f" other {diag['other']:4.1f} N | stream {rate:4.1f} Hz | real time x{rtf:.2f}, late {late}")
                 diag = {"live": 0, "limited": 0, "pos": 0.0, "rot": 0.0, "other": 0.0}
                 limit_hits[:] = False
@@ -398,6 +615,7 @@ def main():
                 late += 1
                 t_next = time.perf_counter()
 
+    discard("app closed")
     rx.close()
     env.close()
 

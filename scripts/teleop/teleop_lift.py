@@ -42,6 +42,8 @@ Run (two terminals):
     python scripts/teleop/teleop_lift.py --stiffness 150     # with the admittance
     python scripts/teleop/teleop_lift.py --no_rotation       # hand keeps its orientation (position only)
     python scripts/teleop/teleop_lift.py --stiffness 150 --record    # record demos at K = 150
+    python scripts/teleop/teleop_lift.py --stiffness 150 --video --cam_eye -0.25 0.12 0.20 --cam_lookat 0.20 0.0 -0.10
+                                                                     # film every episode (no recording)
 
 Operating it: stand as if behind the robot (looking along its +x). Right hand: wrist moves the hand,
 fingers move the fingers. LEFT-hand pinch freezes everything: move your own arm back to a comfortable
@@ -92,6 +94,16 @@ a file whose "format" attribute differs, e.g. demos recorded before q_cmd was th
 
 Check a file with scripts/tools/inspect_demos.py.
 
+Video (--video): every episode is filmed from the moment the clutch engages (the same moment a demo
+starts) until the episode ends, from the GUI's camera (--cam_eye / --cam_lookat, so pass the view
+you want in the video; the IL recordings and policy rollouts use --cam_eye -0.25 0.12 0.20
+--cam_lookat 0.20 0.0 -0.10), one frame per env step (50 fps = real time). Files go to
+logs/il_demos/videos/ (next to --dataset): with --record and a saved demo <dataset name>_<demo>.mp4,
+otherwise teleop_K<K>_<date-time>_<outcome>.mp4 (success, time_limit, cube_off). Episodes ended with
+"r" or "q" are not kept. The frames come from the render the GUI does anyway; reading them out and
+encoding costs some time per step, so watch "real time x" in the status line (and --min_rtf when
+also recording; --video_res 960 540 if it drops).
+
 Status line (once a second): besides position, cube height and forces it shows why the arm may
 not follow your hand (which feels like lag): the largest IK error of the last second, how often a
 joint wanted to move faster than --max_joint_step ("step-limited"), which joints hit their limits,
@@ -129,11 +141,16 @@ parser.add_argument("--dataset", default=None,
                     help="HDF5 file for the demos (default logs/il_demos/lift_K<stiffness>.hdf5); appended to")
 parser.add_argument("--min_rtf", type=float, default=0.95,
                     help="demos recorded slower than this real-time factor are not saved")
+parser.add_argument("--video", action="store_true",
+                    help="film every episode from the clutch engagement to its end (mp4, the GUI's camera)")
+parser.add_argument("--video_res", type=int, nargs=2, default=[1280, 720], help="video width height [px]")
 parser.add_argument("--lp_alpha", type=float, default=0.2,
                     help="the bridge's finger filter (stream_joints.py --lp-alpha); only stored in the file")
 AppLauncher.add_app_launcher_args(parser)
 parser.set_defaults(device="cpu")  # one env: CPU physics is much faster than the GPU
 args_cli = parser.parse_args()
+if args_cli.video:
+    args_cli.enable_cameras = True  # the render product the frames are read from
 FRAME_LIMIT_OFF = "--/app/runLoops/main/rateLimitEnabled=false --/app/vsync=false"
 args_cli.kit_args = f"{args_cli.kit_args or ''} {FRAME_LIMIT_OFF}".strip()
 app_launcher = AppLauncher(args_cli)
@@ -166,6 +183,7 @@ from isaaclab_tasks.utils import parse_env_cfg
 
 import tunable_comp_thesis.tasks  # noqa: F401  (registers the gym tasks)
 from tunable_comp_thesis.controllers import AdmittanceControllerCfg, StaticAdmittanceControllerCfg
+from tunable_comp_thesis.utils import VideoWriter
 from tunable_comp_thesis.tasks.manager_based.lift_compliant.config.ur5_wuji.il_env_cfg import (
     ARM_JOINTS,
     EE_OFFSET,
@@ -388,8 +406,9 @@ def main():
     env_cfg.viewer.eye = tuple(args_cli.cam_eye)
     env_cfg.viewer.lookat = tuple(args_cli.cam_lookat)
     env_cfg.episode_length_s = args_cli.episode_s
+    env_cfg.viewer.resolution = tuple(args_cli.video_res)
 
-    env = gym.make(TASK, cfg=env_cfg)
+    env = gym.make(TASK, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
     uw = env.unwrapped
     robot, cube = uw.scene["robot"], uw.scene["object"]
     hand = uw.action_manager.get_term("hand_action")
@@ -413,6 +432,8 @@ def main():
 
     obs, _ = env.reset()
     obs = obs["policy"]  # (1, 51): the IL state
+    if args_cli.video:  # creates the video's render product now; the steps before the first clutch warm it up
+        uw.render(recompute=True)
     q_arm, q_ref = start_targets()
     p0, R0 = grasp.pose()
     k_name = "inf (admittance off)" if math.isinf(args_cli.stiffness) else f"{args_cli.stiffness:g} N/m"
@@ -461,12 +482,33 @@ def main():
 
     rec: dict | None = None  # the demo being recorded: lists of obs and actions, start times
     episode_step = 0  # env steps since the last reset (for the idle time before the clutch)
+    video: VideoWriter | None = None  # the episode being filmed
+    video_dir = os.path.join(os.path.dirname(args_cli.dataset) if args_cli.dataset else os.path.join("logs", "il_demos"),
+                             "videos")
 
     def discard(why: str):
-        nonlocal rec
+        nonlocal rec, video
         if rec is not None:
             print(f"[record] demo discarded ({why}, {len(rec['obs']) * dt:.1f} s)")
         rec = None
+        if video is not None and why in ("reset", "quit", "app closed"):  # aborted by hand: not kept
+            video.discard()
+            video = None
+
+    def finish_video(outcome: str, demo_name: str | None = None):
+        """Close the episode's video under its final name (with the outcome, or the saved demo's name)."""
+        nonlocal video
+        if video is None:
+            return
+        if demo_name is not None:
+            stem = os.path.splitext(os.path.basename(demos.path))[0]
+            name = f"{stem}_{demo_name}.mp4"
+        else:
+            k = "inf" if math.isinf(args_cli.stiffness) else f"{args_cli.stiffness:g}"
+            name = f"teleop_K{k}_{datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}_{outcome}.mp4"
+        path = video.close(rename_to=os.path.join(video_dir, name))
+        print(f"[video] {path} ({video.frames} frames, {video.seconds:.1f} s)")
+        video = None
 
     rx = QuestReceiver(args_cli.udp)
     cmds = stdin_commands()
@@ -558,6 +600,9 @@ def main():
                 rec = {"obs": [], "act": [], "q_ref": [], "dq": [], "tip_ref_offset": [], "tip_force_raw": [],
                        "t0": time.perf_counter(), "late0": late, "idle_s": episode_step * dt}
                 print(f"[record] demo started (clutch engaged after {rec['idle_s']:.1f} s)")
+            if args_cli.video and video is None and live:  # filmed from the same moment a demo starts
+                video = VideoWriter(os.path.join(video_dir, "teleop_current.mp4"), fps=round(1.0 / dt))
+                print("[video] filming this episode")
             if rec is not None:
                 rec["obs"].append(obs[0].cpu().numpy().copy())  # s_t: the state this step starts from
                 rec["q_ref"].append(q_ref[0].cpu().numpy().copy())  # the operator's finger references
@@ -571,6 +616,10 @@ def main():
                 rec["dq"].append(hand.joint_offsets[0].cpu().numpy().copy())
                 rec["tip_ref_offset"].append(hand.tip_reference_offsets[0].cpu().numpy().copy())
                 rec["tip_force_raw"].append(hand.tip_forces[0].cpu().numpy().copy())
+            if video is not None:
+                # the frame of the render this step already did for the GUI (recompute=True: no extra render);
+                # on the step that ends an episode it still shows the end, the reset comes after the render
+                video.add(uw.render(recompute=True))
             step += 1
             episode_step += 1
             # fingertip contact with anything but the cube (table, other fingers): net force minus cube force
@@ -580,6 +629,7 @@ def main():
                 success = bool(terminated[0]) and bool(uw.termination_manager.get_term("success")[0])
                 if success:
                     print(f"[teleop] SUCCESS: cube held above the target for {hold_s:g} s")
+                    saved_name = None
                     if rec is not None:
                         n = len(rec["obs"])
                         wall = time.perf_counter() - rec["t0"]
@@ -598,10 +648,13 @@ def main():
                             }, extra={k_: np.stack(rec[k_]) for k_ in ("q_ref", "dq", "tip_ref_offset", "tip_force_raw")})
                             print(f"[record] saved {name}: {n} samples, {n * dt:.1f} s, x{rtf:.2f} real time "
                                   f"-> {demos.count} demos in {demos.path}")
+                            saved_name = name
                         rec = None
+                    finish_video("success", saved_name)
                 else:
                     why = "time limit" if bool(truncated[0]) else "cube off the table"
                     discard(why)
+                    finish_video("time_limit" if bool(truncated[0]) else "cube_off")
                     print(f"[teleop] episode ended by the env ({why}), reset")
                 q_arm, q_ref = start_targets()
                 anchor, was_live, episode_step = None, False, 0
@@ -624,6 +677,8 @@ def main():
                 rec_state = ""
                 if demos is not None:
                     rec_state = f"REC {len(rec['obs']) * dt:5.1f} s | " if rec is not None else "rec: wait clutch | "
+                if args_cli.video:
+                    rec_state += f"VIDEO {video.seconds:5.1f} s | " if video is not None else "video: wait clutch | "
                 print(f"[{step * dt:7.1f} s] {rec_state}{state:<34.34} | grasp pt {' '.join(f'{v:+.3f}' for v in p[0].tolist())} m"
                       f" | IK err max {1000 * diag['pos']:4.0f} mm {math.degrees(diag['rot']):5.1f} deg, "
                       f"step-limited {limited:3.0f} %{', at limit: ' + ' '.join(at_limit) if at_limit else ''}"

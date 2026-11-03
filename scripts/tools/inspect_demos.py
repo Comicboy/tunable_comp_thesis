@@ -114,8 +114,12 @@ def inspect(path: str) -> bool:
                     diff = np.abs(q_cmd - (q_ref + dq))
                     clamped = 100.0 * (diff > 1e-4).mean()
                     f_tip = np.linalg.norm(forces, axis=-1)  # (T, 5) smoothed, as the admittance sees it
+                    # first contact: the raw force is sampled only at the last physics step of each env step,
+                    # so a brief touch in the step's first physics step is missed there; the smoothed force in
+                    # the next state (obs row t + 1 = after step t) still shows it
                     raw = np.linalg.norm(g["tip_force_raw"][()], axis=-1).sum(-1)  # (T,) same rows as dq
-                    touch = np.nonzero(raw > 0.0)[0]
+                    smooth_next = np.append(f_tip.sum(-1)[1:], 0.0)  # (T,) smoothed force after step t
+                    touch = np.nonzero((raw > 0.0) | (smooth_next > 0.0))[0]
                     first = int(touch[0]) if touch.size else T
                     if first > 0 and np.abs(dq[:first]).max() > 1e-6:
                         fails.append(f"dq != 0 before the first contact ({np.abs(dq[:first]).max():.1e} rad)")

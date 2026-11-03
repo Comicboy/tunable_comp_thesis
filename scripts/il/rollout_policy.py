@@ -38,6 +38,13 @@ by the server, plus _only<episodes> for --only runs; an existing full-run file i
 without --overwrite, --only runs are) with the settings, the
 server's info and every episode.
 
+Videos (--video, usually with --only): the policy part of every episode (from the end of the settling
+to the episode's end) from the palm-following camera (--cam_eye / --cam_lookat, by default the view of
+the demo recordings), one mp4 per episode in <results name>_videos/ep<NNN>_K<K>_<outcome>.mp4, one frame
+per env step (50 fps = real time). Rendering slows the run down; the physics is the same.
+
+    python scripts/il/rollout_policy.py --stiffness 150 --tag act_qcmd_v1 --only 12 31 --video --headless
+
 Trajectories: next to the JSON file, <same name>.hdf5 holds every episode's states and actions in the
 layout of the demo files (/data/ep_NNN/obs (T, 51) = the state each step started from, /actions
 (T, 26) = the action sent in it; attrs outcome, success, duration_s; file attrs stiffness, step_dt,
@@ -68,6 +75,9 @@ parser.add_argument("--out", default=None,
 parser.add_argument("--overwrite", action="store_true", help="replace an existing results file")
 parser.add_argument("--realtime", action="store_true", help="pace the sim to real time (for watching)")
 parser.add_argument("--no_traj", action="store_true", help="do not save the states and actions (.hdf5)")
+parser.add_argument("--video", action="store_true",
+                    help="save the policy part of every episode as an mp4 (camera as below; use with --only)")
+parser.add_argument("--video_res", type=int, nargs=2, default=[1280, 720], help="video width height [px]")
 parser.add_argument("--cam_eye", type=float, nargs=3, default=[-0.25, 0.12, 0.20],
                     help="camera position relative to the palm [m] (default: the view used for the recordings)")
 parser.add_argument("--cam_lookat", type=float, nargs=3, default=[0.20, 0.0, -0.10],
@@ -75,6 +85,8 @@ parser.add_argument("--cam_lookat", type=float, nargs=3, default=[0.20, 0.0, -0.
 AppLauncher.add_app_launcher_args(parser)
 parser.set_defaults(device="cpu")  # as for the demos
 args_cli = parser.parse_args()
+if args_cli.video:
+    args_cli.enable_cameras = True  # off-screen rendering of the viewer camera
 FRAME_LIMIT_OFF = "--/app/runLoops/main/rateLimitEnabled=false --/app/vsync=false"
 args_cli.kit_args = f"{args_cli.kit_args or ''} {FRAME_LIMIT_OFF}".strip()
 simulation_app = AppLauncher(args_cli).app
@@ -94,6 +106,7 @@ from isaaclab_tasks.utils import parse_env_cfg
 
 import tunable_comp_thesis.tasks  # noqa: F401  (registers the gym tasks)
 from tunable_comp_thesis.controllers import AdmittanceControllerCfg
+from tunable_comp_thesis.utils import VideoWriter
 from tunable_comp_thesis.tasks.manager_based.lift_compliant.config.ur5_wuji.il_env_cfg import (
     ARM_JOINTS,
     CUBE_CENTER,
@@ -150,7 +163,8 @@ def main():
     env_cfg.viewer.body_name = PALM
     env_cfg.viewer.eye = tuple(args_cli.cam_eye)
     env_cfg.viewer.lookat = tuple(args_cli.cam_lookat)
-    env = gym.make(TASK, cfg=env_cfg)
+    env_cfg.viewer.resolution = tuple(args_cli.video_res)
+    env = gym.make(TASK, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
     uw = env.unwrapped
     dt = uw.step_dt
     success_cfg = uw.termination_manager.get_term_cfg("success")
@@ -206,6 +220,9 @@ def main():
         raise SystemExit(f"[rollout] sizes (state, env_state, action) differ: env {expected}, policy {got}")
     # trajectories (same layout as the demo files), written after every episode
     traj = None if args_cli.no_traj else os.path.splitext(out)[0] + ".hdf5"
+    video_dir = os.path.splitext(out)[0] + "_videos" if args_cli.video else None
+    if video_dir:
+        os.makedirs(video_dir, exist_ok=True)
     if traj is not None:
         os.makedirs(os.path.dirname(os.path.abspath(traj)), exist_ok=True)
         ends = np.cumsum(dims).tolist()
@@ -233,6 +250,9 @@ def main():
 
     results = []
     obs, _ = env.reset()
+    if video_dir:  # the renderer needs a few frames before the image is complete (first ones can be black)
+        for _ in range(10):
+            uw.render()
     with torch.inference_mode():
         for ep in episodes:
             place_cube(ep)
@@ -243,6 +263,7 @@ def main():
             cube0 = o[env_idx].tolist()
             max_lift, steps, replans, infer_ms = 0.0, 0, 0, []
             obs_log, act_log = [], []
+            video = VideoWriter(os.path.join(video_dir, f"ep{ep:03d}.mp4"), fps=round(1.0 / dt)) if video_dir else None
             t_wall = time.perf_counter()
             while True:
                 o = obs["policy"][0].cpu().numpy().astype(float)
@@ -250,6 +271,8 @@ def main():
                 replans += int(rep["replanned"])
                 infer_ms.append(rep["infer_ms"])
                 action = torch.tensor([rep["action"]], dtype=torch.float, device=uw.device)
+                if video is not None:  # the frame of s_t (the step that ends an episode already shows the next one)
+                    video.add(uw.render())
                 obs_log.append(o.astype(np.float32))  # s_t: the state this step starts from
                 act_log.append(np.asarray(rep["action"], dtype=np.float32))  # a_t
                 obs, _, terminated, truncated, _ = env.step(action)
@@ -288,6 +311,10 @@ def main():
                     g.create_dataset("actions", data=np.stack(act_log))
                     g.attrs.update({"episode": ep, "outcome": outcome, "success": outcome == "success",
                                     "duration_s": steps * dt})
+            if video is not None:
+                name = f"ep{ep:03d}_K{args_cli.stiffness:g}_{outcome.replace(' ', '_')}.mp4"
+                path = video.close(rename_to=os.path.join(video_dir, name))
+                print(f"[rollout] video -> {path} ({video.frames} frames, {video.seconds:.1f} s)")
             print(f"[rollout] episode {ep:3d}: {outcome:<18} {r['duration_s']:5.1f} s | cube start "
                   f"({cube0[0]:+.3f}, {cube0[1]:+.3f}) | max lift {100 * max_lift:5.1f} cm "
                   f"(target {100 * height:.0f}) | replans {replans}")

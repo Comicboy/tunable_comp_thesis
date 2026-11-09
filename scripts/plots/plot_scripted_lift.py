@@ -18,51 +18,31 @@ fingers 2-5 is also loaded where the cube touches the finger above the tip, whic
 admittance does not see, so its torque hardly changes with K.) Runs logged before the torque was recorded use the drive deflection q_cmd - q instead
 (the PD torque is proportional to it at rest), and have no force-vs-position figure.
 
-    python scripts/experiments/plot_scripted_lift.py logs/scripted_lift/dynamic_<time>.npz \
-        logs/scripted_lift/static_<time>.npz [--out logs/scripted_lift/plots] [--finger 3] [--pdf]
+    python scripts/plots/plot_scripted_lift.py logs/scripted_lift/dynamic_<time>.npz \
+        logs/scripted_lift/static_<time>.npz [--out logs/scripted_lift/plots] [--finger 3]
 
-Only numpy and matplotlib are needed (no Isaac Sim).
+Only numpy and matplotlib are needed (no Isaac Sim). PNG only; colours, fonts and saving come from
+scripts/plots/plot_style.py, shared with plot_il.py (the IL figures).
 """
 
 import argparse
 import os
 
-import matplotlib
+import matplotlib.pyplot as plt
+import numpy as np
 
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt  # noqa: E402
-import numpy as np  # noqa: E402
+from plot_style import (  # noqa: F401  (shared look, scripts/plots/plot_style.py)
+    AXIS, FINGER_COLOR, FINGER_MARKER, FINGERS, INK, INK_2, MUTED, PHASE_BAND, RIGID, SURFACE, save,
+)
+from plot_style import K_RAMP as K_STEPS
 
-FINGERS = ["thumb", "index", "middle", "ring", "little"]
 # finger -> joint whose torque shows the fingertip load: joint3 of every finger. (joint1 of fingers 2-5
 # carries an offset that does not change with K, from the cube touching the finger above the tip)
 MAIN_JOINT = {1: 3, 2: 3, 3: 3, 4: 3, 5: 3}
 LOADING = ("close", "squeeze")  # phases in which the fingers press on the cube resting on the table
-
-# --- style ---------------------------------------------------------------------------------------
-INK, INK_2, MUTED, GRID, AXIS = "#0b0b0b", "#52514e", "#898781", "#e1e0d9", "#c3c2b7"
-SURFACE, PHASE_BAND = "#fcfcfb", "#f0efec"
-# stiffness is an ordered magnitude: one blue ramp, softer = lighter (validated as an ordinal ramp);
-# the rigid baseline (K = inf) is dark gray and dashed
-K_STEPS = ["#86b6ef", "#5598e7", "#2a78d6", "#184f95"]
-RIGID = "#52514e"
 # controller identity: categorical slots 1 and 2
 CONTROLLER_COLOR = {"dynamic": "#2a78d6", "static": "#eb6834"}
 CONTROLLER_STYLE = {"dynamic": "-", "static": "--"}
-# fingers as categories: categorical slots 1-5 in fixed order
-FINGER_COLOR = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4"]
-FINGER_MARKER = ["o", "s", "^", "D", "v"]
-
-plt.rcParams.update({
-    "figure.facecolor": SURFACE, "axes.facecolor": SURFACE, "savefig.facecolor": SURFACE,
-    "font.family": "sans-serif", "font.size": 9,
-    "axes.edgecolor": AXIS, "axes.labelcolor": INK_2, "axes.titlecolor": INK, "axes.titlesize": 10,
-    "axes.titleweight": "bold", "axes.titlelocation": "left",
-    "axes.grid": True, "grid.color": GRID, "grid.linewidth": 0.6,
-    "axes.spines.top": False, "axes.spines.right": False,
-    "xtick.color": MUTED, "ytick.color": MUTED, "xtick.labelcolor": INK_2, "ytick.labelcolor": INK_2,
-    "legend.frameon": False, "legend.fontsize": 8, "lines.linewidth": 1.6,
-})
 
 
 def load(path: str) -> dict:
@@ -148,18 +128,8 @@ def k_axis(ax, all_k):
     return lambda K: np.array([pos[float(k)] for k in K], dtype=float)
 
 
-def save(fig, out_dir: str, name: str, pdf: bool):
-    os.makedirs(out_dir, exist_ok=True)
-    path = os.path.join(out_dir, f"{name}.png")
-    fig.savefig(path, dpi=160, bbox_inches="tight")
-    if pdf:
-        fig.savefig(os.path.join(out_dir, f"{name}.pdf"), bbox_inches="tight")
-    plt.close(fig)
-    print(f"[INFO] saved {path}")
-
-
 # --- per run ---------------------------------------------------------------------------------------
-def plot_overview(d, all_k, out_dir, pdf):
+def plot_overview(d, all_k, out_dir):
     t, K = d["t"], d["stiffness"]
     rows = [
         ("Cube height above rest", "cm", d["height"]),
@@ -180,10 +150,10 @@ def plot_overview(d, all_k, out_dir, pdf):
     fig.suptitle(f"Scripted lift, {d['controller']} admittance ({d['name']})", x=0.01, ha="left",
                  fontsize=11, fontweight="bold", color=INK)
     fig.tight_layout()
-    save(fig, out_dir, f"{d['name']}_overview", pdf)
+    save(fig, out_dir, f"{d['name']}_overview")
 
 
-def plot_fingers(d, all_k, out_dir, pdf):
+def plot_fingers(d, all_k, out_dir):
     t, K = d["t"], d["stiffness"]
     fig, axes = plt.subplots(2, 5, figsize=(15, 6), sharex=True, sharey="row")
     for f in range(5):
@@ -201,10 +171,10 @@ def plot_fingers(d, all_k, out_dir, pdf):
     fig.suptitle(f"Fingertips, {d['controller']} admittance ({d['name']}); shaded bands = phases "
                  + ", ".join(d["phase_names"]), x=0.01, ha="left", fontsize=11, fontweight="bold", color=INK)
     fig.tight_layout()
-    save(fig, out_dir, f"{d['name']}_fingers", pdf)
+    save(fig, out_dir, f"{d['name']}_fingers")
 
 
-def plot_joints(d, all_k, out_dir, pdf, finger: int):
+def plot_joints(d, all_k, out_dir, finger: int):
     t, K, names = d["t"], d["stiffness"], d["joint_names"]
     cols = [("thumb joint3", names.index("right_finger1_joint3")),
             (f"{FINGERS[finger - 1]} joint1", names.index(f"right_finger{finger}_joint1"))]
@@ -227,10 +197,10 @@ def plot_joints(d, all_k, out_dir, pdf, finger: int):
     fig.suptitle(f"Joint reference, command and position, {d['controller']} admittance ({d['name']})",
                  x=0.01, ha="left", fontsize=11, fontweight="bold", color=INK)
     fig.tight_layout()
-    save(fig, out_dir, f"{d['name']}_joints", pdf)
+    save(fig, out_dir, f"{d['name']}_joints")
 
 
-def plot_torque(d, all_k, out_dir, pdf):
+def plot_torque(d, all_k, out_dir):
     """Main-joint torque of every finger over time (top) and at the end of the squeeze against K (bottom)."""
     t, K = d["t"], d["stiffness"]
     fig = plt.figure(figsize=(15, 7))
@@ -266,10 +236,10 @@ def plot_torque(d, all_k, out_dir, pdf):
     fig.suptitle(f"Main-joint {d['tau_name']}, {d['controller']} admittance ({d['name']})", x=0.01, ha="left",
                  fontsize=11, fontweight="bold", color=INK)
     fig.tight_layout()
-    save(fig, out_dir, f"{d['name']}_torque", pdf)
+    save(fig, out_dir, f"{d['name']}_torque")
 
 
-def plot_force_vs(d, all_k, out_dir, pdf, kind: str):
+def plot_force_vs(d, all_k, out_dir, kind: str):
     """Contact force against the reference penetration while the cube rests on the table (close, squeeze).
 
     kind "angle": x = |q_ref - q| of the main joint [rad] (joint space)
@@ -309,11 +279,11 @@ def plot_force_vs(d, all_k, out_dir, pdf, kind: str):
     fig.suptitle(f"Contact force vs {x_label}, close + squeeze, {d['controller']} admittance ({d['name']}){note}",
                  x=0.01, ha="left", fontsize=11, fontweight="bold", color=INK)
     fig.tight_layout()
-    save(fig, out_dir, f"{d['name']}_force_vs_{kind}", pdf)
+    save(fig, out_dir, f"{d['name']}_force_vs_{kind}")
 
 
 # --- controller comparison -------------------------------------------------------------------------
-def plot_compare(runs, out_dir, pdf):
+def plot_compare(runs, out_dir):
     shared = sorted(set.intersection(*[set(r["stiffness"].tolist()) for r in runs]), key=lambda k: (np.isinf(k), k))
     if len(shared) > 4:  # at most four panels: spread over the range, always with the softest and rigid
         shared = [shared[i] for i in sorted(set(np.linspace(0, len(shared) - 1, 4).round().astype(int)))]
@@ -379,10 +349,10 @@ def plot_compare(runs, out_dir, pdf):
                  + "  (shaded: approach, close, lift)", x=0.01, ha="left",
                  fontsize=11, fontweight="bold", color=INK)
     fig.tight_layout()
-    save(fig, out_dir, "compare_controllers", pdf)
+    save(fig, out_dir, "compare_controllers")
 
 
-def plot_compare_torque(runs, all_k, out_dir, pdf):
+def plot_compare_torque(runs, all_k, out_dir):
     fig, axes = plt.subplots(1, 5, figsize=(16, 4.2), sharey=True)
     for f in range(5):
         ax = axes[f]
@@ -401,7 +371,7 @@ def plot_compare_torque(runs, all_k, out_dir, pdf):
                  x=0.01, ha="left",
                  fontsize=11, fontweight="bold", color=INK)
     fig.tight_layout()
-    save(fig, out_dir, "compare_torque", pdf)
+    save(fig, out_dir, "compare_torque")
 
 
 def print_table(runs):
@@ -420,25 +390,24 @@ def main():
     parser.add_argument("runs", nargs="+", help="npz files written by scripted_lift.py")
     parser.add_argument("--out", default=os.path.join("logs", "scripted_lift", "plots"))
     parser.add_argument("--finger", type=int, default=3, help="finger (2-5) whose joint1 the joint plot shows")
-    parser.add_argument("--pdf", action="store_true", help="also save PDFs (for the thesis)")
     args = parser.parse_args()
 
     runs = [load(p) for p in args.runs]
     all_k = [float(k) for r in runs for k in r["stiffness"]]
     for d in runs:
-        plot_overview(d, all_k, args.out, args.pdf)
-        plot_fingers(d, all_k, args.out, args.pdf)
-        plot_joints(d, all_k, args.out, args.pdf, args.finger)
-        plot_torque(d, all_k, args.out, args.pdf)
-        plot_force_vs(d, all_k, args.out, args.pdf, "angle")
+        plot_overview(d, all_k, args.out)
+        plot_fingers(d, all_k, args.out)
+        plot_joints(d, all_k, args.out, args.finger)
+        plot_torque(d, all_k, args.out)
+        plot_force_vs(d, all_k, args.out, "angle")
         if d["delta_ref"] is not None:
-            plot_force_vs(d, all_k, args.out, args.pdf, "position")
+            plot_force_vs(d, all_k, args.out, "position")
         else:
             print(f"[INFO] {d['name']}: no fingertip reference penetration logged (older run), "
                   "skipping force_vs_position")
     if len({r["controller"] for r in runs}) > 1:
-        plot_compare(runs, args.out, args.pdf)
-        plot_compare_torque(runs, all_k, args.out, args.pdf)
+        plot_compare(runs, args.out)
+        plot_compare_torque(runs, all_k, args.out)
     print_table(runs)
 
 

@@ -49,7 +49,7 @@ Trajectories: next to the JSON file, <same name>.hdf5 holds every episode's stat
 layout of the demo files (/data/ep_NNN/obs (T, 51) = the state each step started from, /actions
 (T, 26) = the action sent in it; attrs outcome, success, duration_s; file attrs stiffness, step_dt,
 obs_terms, joint names, success condition, server info), so the rollouts can be compared with the
-demos by the same code (scripts/il/plot_stiffness_behaviour.py). --no_traj switches this off.
+demos by the same code (scripts/plots/plot_il.py). --no_traj switches this off.
 """
 
 import argparse

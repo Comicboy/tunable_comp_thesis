@@ -1,6 +1,8 @@
 """Offline K-swap test: does the policy change its finger commands with K the way the admittance law does?
 
-Runs in the "lerobot" conda env (needs the trained checkpoint, torch, h5py, matplotlib); no simulation.
+Runs in the "lerobot" conda env (needs the trained checkpoint, torch, h5py); no simulation. It only
+computes: the figures are drawn by scripts/plots/plot_il.py --kswap <out folder> (fig6, and with
+--extra kswap_time / kswap_hold) from the two files this script writes.
 Every recorded demo state is fed to the policy twice, once with log10 K = log10 150 and once with
 log10 500 (one of them is the demo's own K), everything else in the state unchanged. The difference
 of the two predicted actions,
@@ -25,10 +27,16 @@ force changes, dq lags behind f / K (time scale sqrt(M / K), 24-45 ms), so the h
 
     python scripts/il/kswap_test.py \\
         --policy logs/il_train/act_qcmd_v1/checkpoints/last/pretrained_model \\
-        --demos logs/il_demos/lift_K150.hdf5 logs/il_demos/lift_K500.hdf5 [--out DIR] [--pdf]
+        --demos logs/il_demos/lift_K150.hdf5 logs/il_demos/lift_K500.hdf5 [--out DIR]
 
-What it shows (printed, plus kswap_time.png and kswap_hold.png in --out, default
-logs/il_eval/analysis/<run>_kswap):
+    # the same on the validation demos (never trained on; results go to <run>_val):
+    python scripts/il/kswap_test.py --policy ... \
+        --demos logs/il_demos_val/lift_K150.hdf5 logs/il_demos_val/lift_K500.hdf5
+
+Output (--out, default logs/il_eval/kswap/<run>/, or <run>_val/ when the demo files are validation demos,
+file attribute split = val): summary.json (the printed tables) and kswap.h5 (per demo and step: D_pred
+and D* per finger, D_pred with the pre-contact offset removed, the arm's D_pred, the fingertip forces
+and the first contact; and the absolute commands, see below; for the plots). What it shows:
 
   before contact (no force yet; dq = 0): D* = 0, so any D_pred is the policy using K for something
       other than the admittance (e.g. a difference between the two demo sets). Clear-cut test.
@@ -48,8 +56,23 @@ logs/il_eval/analysis/<run>_kswap):
   arm: the arm targets should not change with K at all (the admittance acts on the fingers only).
   fit: how close the policy's prediction at the demo's own K is to the recorded action (for scale).
 
-The action used is the first action of the predicted chunk at that state (what the policy outputs
-with no history; in the rollouts temporal ensembling also averaged older predictions).
+The action used for D_pred and the tables is the first action of the predicted chunk at that state
+(what the policy outputs with no history; in the rollouts temporal ensembling also averaged older
+predictions).
+
+Absolute commands (for comparing the policy's commands with the admittance's, state by state): kswap.h5
+also holds, per demo and step, the policy's full action at both K in two versions,
+
+    act_first (T, 2, 26)  first action of the chunk predicted at that state, [K_lo, K_hi]
+    act_ens   (T, 2, 26)  what temporal ensembling would execute at that step if the policy had run along
+                          this demo with that K from its first step: the weighted mean of the predictions
+                          for step t made at the states t, t-1, ..., t-H+1 (H = chunk size), weight
+                          exp(-m i) with i = 0 for the oldest (as LeRobot's ACTTemporalEnsembler,
+                          m = --temporal_ensemble, 0.01 in the rollouts)
+
+next to the demo's recorded action act_rec (T, 26) (the admittance's q_cmd for the hand), the operator's
+q_ref (T, 20), the admittance offset dq (T, 20), the measured hand angles q_hand (T, 20) and the clamped
+mask (T, 20). Joint orders: attrs arm_joints, hand_joints. The fit table is printed for both versions.
 """
 
 import argparse
@@ -58,10 +81,6 @@ import os
 from pathlib import Path
 
 import h5py
-import matplotlib
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
 
@@ -74,10 +93,12 @@ parser.add_argument("--demos", nargs=2, required=True, help="the two demo files 
 parser.add_argument("--out", default=None, help="folder for plots and the summary JSON")
 parser.add_argument("--device", default="cuda")
 parser.add_argument("--batch", type=int, default=1024, help="states per forward pass")
-parser.add_argument("--hold_s", type=float, default=2.5, help="hold window: the last hold_s of each demo [s]")
+parser.add_argument("--hold_s", type=float, default=3.0, help="hold window: the last hold_s of each demo [s] "
+                    "(3 s = the success hold, as in plot_il.py)")
 parser.add_argument("--boot", type=int, default=2000, help="bootstrap resamples (over demos) for the gain intervals")
 parser.add_argument("--task", default="Lift the cube 15 cm above the table and hold it there")
-parser.add_argument("--pdf", action="store_true", help="also save PDFs")
+parser.add_argument("--temporal_ensemble", type=float, default=0.01,
+                    help="coefficient m of the ensembled commands act_ens (the rollouts used 0.01)")
 args = parser.parse_args()
 
 STATE, ENV_STATE = "observation.state", "observation.environment_state"
@@ -88,27 +109,6 @@ TOUCH_N = 1e-3    # [N] summed smoothed force: first contact of the demo
 PRE_N = 10        # samples (0.2 s) before the first contact: the policy's K offset there is removed for g_adj
 CLAMP_TOL = 1e-4  # [rad] |q_cmd - (q_ref + dq)| above this: q_cmd was clamped to a joint limit
 MAX_OFFSET = 0.03  # [m] the admittance's clamp on |e| per fingertip (AdmittanceControllerCfg.max_offset)
-WINDOW = (-2.0, 5.0)  # [s] around the first contact in the time plot
-
-# --- style (as analyse_qcmd_rollouts.py) ----------------------------------------------------------
-INK, INK_2, MUTED, GRID, AXIS = "#0b0b0b", "#52514e", "#898781", "#e1e0d9", "#c3c2b7"
-SURFACE = "#fcfcfb"
-K_COLOR = {150.0: "#5598e7", 500.0: "#184f95"}
-plt.rcParams.update({
-    "figure.facecolor": SURFACE, "axes.facecolor": SURFACE, "savefig.facecolor": SURFACE,
-    "font.family": "sans-serif", "font.size": 9,
-    "axes.edgecolor": AXIS, "axes.labelcolor": INK_2, "axes.titlecolor": INK, "axes.titlesize": 10,
-    "axes.titleweight": "bold", "axes.titlelocation": "left",
-    "axes.grid": True, "grid.color": GRID, "grid.linewidth": 0.6,
-    "axes.spines.top": False, "axes.spines.right": False,
-    "xtick.color": MUTED, "ytick.color": MUTED, "xtick.labelcolor": INK_2, "ytick.labelcolor": INK_2,
-    "legend.frameon": False, "legend.fontsize": 8, "lines.linewidth": 1.6,
-})
-
-
-def k_color(k):
-    return K_COLOR.get(float(k), INK)
-
 
 # ---------------------------------------------------------------------------------------------------
 # policy
@@ -127,16 +127,37 @@ def load_policy():
 
 
 def predict(policy, pre, post, states: np.ndarray, envs: np.ndarray) -> np.ndarray:
-    """First action of the predicted chunk for every state (no action queue, no ensembling): (N, 26)."""
+    """The whole predicted chunk for every state (no action queue, no ensembling), in joint units: (N, H, 26).
+
+    The post-processor (un-normalisation) is applied to the chunk flattened to (B * H, 26), the shape it
+    gets in the rollouts one action at a time."""
     out = []
     with torch.inference_mode():
         for i in range(0, len(states), args.batch):
             batch = {STATE: torch.from_numpy(states[i:i + args.batch]),
                      ENV_STATE: torch.from_numpy(envs[i:i + args.batch]),
                      "task": [args.task] * len(states[i:i + args.batch]), "robot_type": "ur5_wuji"}
-            chunk = policy.predict_action_chunk(pre(batch))  # (B, chunk, 26), normalised
-            out.append(post(chunk[:, 0]).detach().cpu().numpy())
-    return np.concatenate(out).astype(np.float64)
+            chunk = policy.predict_action_chunk(pre(batch))  # (B, H, 26), normalised
+            b, h, n = chunk.shape
+            out.append(post(chunk.reshape(b * h, n)).detach().cpu().numpy().reshape(b, h, n))
+    return np.concatenate(out).astype(np.float32)
+
+
+def ensemble(chunks: np.ndarray, m: float) -> np.ndarray:
+    """Temporal ensembling along one trajectory, as LeRobot's ACTTemporalEnsembler: (T, H, 26) -> (T, 26).
+
+    The action executed at step t averages the predictions for step t made at the states t - k
+    (k = 0 .. min(t, H - 1); element k of that chunk), the oldest weighted most: arrival index i = 0 for
+    the oldest, weight exp(-m i). Averaging in joint units equals averaging in normalised units (the
+    un-normalisation is affine per dimension and the weights are normalised)."""
+    T, H, _ = chunks.shape
+    w = np.exp(-m * np.arange(H))
+    out = np.empty((T, chunks.shape[-1]), np.float64)
+    for t in range(T):
+        k = np.arange(min(t + 1, H))  # age of the prediction in steps
+        wk = w[len(k) - 1 - k]        # arrival index: the oldest (largest k) gets w[0]
+        out[t] = (wk[:, None] * chunks[t - k, k]).sum(0) / wk.sum()
+    return out
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -150,7 +171,9 @@ def load_demos(path):
         terms = json.loads(a["obs_terms"])
         hand = json.loads(a["hand_joints"])
         info = {"K": float(a["stiffness"]), "dt": float(a["step_dt"]), "n_arm": len(json.loads(a["arm_joints"])),
-                "arm_joints": json.loads(a["arm_joints"]),
+                "arm_joints": json.loads(a["arm_joints"]), "hand_joints": hand,
+                "split": (lambda v: v.decode() if isinstance(v, bytes) else str(v))(a.get("split", "train")),
+                "path": path,
                 "finger_idx": [[i for i, n in enumerate(hand) if n.startswith(f"right_finger{k}_")] for k in range(1, 6)],
                 "terms": terms, "demos": []}
         for name in sorted(f["data"].keys()):
@@ -204,9 +227,14 @@ def main():
     cfg, policy, pre, post = load_policy()
     run = Path(args.policy).parts
     run = run[run.index("il_train") + 1] if "il_train" in run else Path(args.policy).name
-    out_dir = args.out or os.path.join("logs", "il_eval", "analysis", f"{run}_kswap")
+    splits = {s["split"] for s in sets}
+    if len(splits) > 1:
+        raise SystemExit(f"the two demo files are from different splits: {sorted(splits)}")
+    split = splits.pop()
+    out_dir = args.out or os.path.join("logs", "il_eval", "kswap", run + ("_val" if split == "val" else ""))
     os.makedirs(out_dir, exist_ok=True)
-    print(f"[kswap] policy {args.policy} ({cfg.type}); swapping log10 K between {k_lo:g} and {k_hi:g}")
+    print(f"[kswap] policy {args.policy} ({cfg.type}); swapping log10 K between {k_lo:g} and {k_hi:g}; "
+          f"{'validation' if split == 'val' else 'training'} demos; ensembled commands with m = {args.temporal_ensemble:g}")
 
     per_demo = []  # one dict per demo with per-step arrays
     for s in sets:
@@ -217,8 +245,10 @@ def main():
             st, env = obs[:, state_idx].copy(), obs[:, env_idx].copy()
             st_lo, st_hi = st.copy(), st.copy()
             st_lo[:, k_pos], st_hi[:, k_pos] = np.log10(k_lo), np.log10(k_hi)
-            both = predict(policy, pre, post, np.concatenate([st_lo, st_hi]), np.concatenate([env, env]))
-            a_lo, a_hi = both[:T], both[T:]
+            chunks = predict(policy, pre, post, np.concatenate([st_lo, st_hi]), np.concatenate([env, env]))
+            a_lo, a_hi = chunks[:T, 0].astype(np.float64), chunks[T:, 0].astype(np.float64)  # first actions
+            e_lo, e_hi = ensemble(chunks[:T], args.temporal_ensemble), ensemble(chunks[T:], args.temporal_ensemble)
+            del chunks
             d_pred = a_lo - a_hi  # (T, 26)
             q_cmd = d["act"][:, n_arm:]
             clamped = np.abs(q_cmd - (d["q_ref"] + d["dq"])) > CLAMP_TOL  # (T, 20)
@@ -228,6 +258,7 @@ def main():
             hand_star = np.where(clamped, 0.0, d_star)
             touch = np.nonzero((forces.sum(-1) > TOUCH_N) | (np.abs(d["dq"]).max(-1) > 0))[0]
             a_own = a_lo if s["K"] == k_lo else a_hi
+            e_own = e_lo if s["K"] == k_lo else e_hi
             first = int(touch[0]) if touch.size else T
             # the policy's K offset just before contact (no force yet): mean D_pred over the last PRE_N samples
             off = d_pred[max(first - PRE_N, 0):first, n_arm:].mean(0) if first > 0 else np.zeros(d_pred.shape[1] - n_arm)
@@ -241,20 +272,35 @@ def main():
                 "pred_raw": [d_pred[:, n_arm:][:, ix] for ix in fidx],
                 "fit_arm": np.abs(a_own[:, :n_arm] - d["act"][:, :n_arm]).mean(-1),
                 "fit_hand": [np.linalg.norm(a_own[:, n_arm:][:, ix] - q_cmd[:, ix], axis=-1) for ix in fidx],
+                "fit_arm_ens": np.abs(e_own[:, :n_arm] - d["act"][:, :n_arm]).mean(-1),
+                "fit_hand_ens": [np.linalg.norm(e_own[:, n_arm:][:, ix] - q_cmd[:, ix], axis=-1) for ix in fidx],
+                # absolute commands (index 1: [K_lo, K_hi]) and the recorded quantities they are compared with
+                "act_first": np.stack([a_lo, a_hi], axis=1), "act_ens": np.stack([e_lo, e_hi], axis=1),
+                "act_rec": d["act"], "q_ref": d["q_ref"], "dq": d["dq"],
+                "q_hand": obs[:, [i for name, s0, e0 in s["terms"] if name == "hand_joint_pos" for i in range(s0, e0)]],
             })
         print(f"[kswap] {len(s['demos'])} demos at K = {s['K']:g} done")
     arm_names = [n.replace("_joint", "") for n in sets[0]["arm_joints"]]
-    summary = {"policy": args.policy, "demos": args.demos, "K": [k_lo, k_hi]}
+    summary = {"policy": args.policy, "demos": args.demos, "split": split, "K": [k_lo, k_hi],
+               "temporal_ensemble": args.temporal_ensemble}
 
     # --- fit ------------------------------------------------------------------------------------------
     print("\n=== fit at the demo's own K: median |prediction - recorded action| [mrad] (arm: mean over joints; "
-          "fingers: norm over 4 joints)")
-    print(f"{'':<14}{'arm':>9}" + "".join(f"{f:>9}" for f in FINGERS))
+          "fingers: norm over 4 joints); first action of the chunk / ensembled")
+    print(f"{'':<14}{'arm':>14}" + "".join(f"{f:>14}" for f in FINGERS))
+    summary["fit_mrad_first_ens"] = {}
     for k in (k_lo, k_hi):
         ds = [d for d in per_demo if d["K"] == k]
-        arm = np.median(np.concatenate([d["fit_arm"] for d in ds]))
-        fing = [np.median(np.concatenate([d["fit_hand"][f] for d in ds])) for f in range(5)]
-        print(f"{f'demos K{k:g}':<14}{1000 * arm:>9.1f}" + "".join(f"{1000 * v:>9.1f}" for v in fing))
+        cells, row = [], {}
+        for key, name in (("fit_arm", "arm"), *((f, FINGERS[f]) for f in range(5))):
+            if key == "fit_arm":
+                v1, v2 = (np.median(np.concatenate([d[x] for d in ds])) for x in ("fit_arm", "fit_arm_ens"))
+            else:
+                v1, v2 = (np.median(np.concatenate([d[x][key] for d in ds])) for x in ("fit_hand", "fit_hand_ens"))
+            cells.append(f"{1000 * v1:.1f} / {1000 * v2:.1f}")
+            row[name] = [1000 * float(v1), 1000 * float(v2)]
+        print(f"{f'demos K{k:g}':<14}" + "".join(f"{c:>14}" for c in cells))
+        summary["fit_mrad_first_ens"][f"demos K{k:g}"] = row
 
     # --- before contact ---------------------------------------------------------------------------------
     pre_rows = {}
@@ -344,119 +390,34 @@ def main():
     summary["hold"] = gain_table("hold")
     with open(os.path.join(out_dir, "summary.json"), "w") as fh:
         json.dump(summary, fh, indent=1, default=float)
-
-    plot_time(per_demo, (k_lo, k_hi), out_dir)
-    plot_hold(per_demo, (k_lo, k_hi), out_dir, n_hold)
-    print(f"\n[kswap] summary -> {os.path.join(out_dir, 'summary.json')}")
-
-
-# ---------------------------------------------------------------------------------------------------
-# figures
-# ---------------------------------------------------------------------------------------------------
-def save(fig, out_dir, name):
-    path = os.path.join(out_dir, f"{name}.png")
-    fig.savefig(path, dpi=160, bbox_inches="tight")
-    if args.pdf:
-        fig.savefig(os.path.join(out_dir, f"{name}.pdf"), bbox_inches="tight")
-    plt.close(fig)
-    print(f"[plot] {path}")
+    save_arrays(per_demo, (k_lo, k_hi), os.path.join(out_dir, "kswap.h5"),
+                {"split": split, "temporal_ensemble": args.temporal_ensemble, "chunk_size": int(cfg.chunk_size),
+                 "arm_joints": json.dumps(sets[0]["arm_joints"]), "hand_joints": json.dumps(sets[0]["hand_joints"]),
+                 "demo_files": json.dumps([s["path"] for s in sets])})
+    print(f"\n[kswap] summary -> {os.path.join(out_dir, 'summary.json')}, arrays -> {os.path.join(out_dir, 'kswap.h5')}")
 
 
-def band(rows):
-    """Median and quartiles over demos (rows with NaN where a demo has no sample)."""
-    m = np.array(rows)
-    enough = (~np.isnan(m)).sum(0) >= 3
-    import warnings
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", RuntimeWarning)
-        return tuple(np.where(enough, np.nanpercentile(m, p, 0), np.nan) for p in (50, 25, 75))
-
-
-def plot_time(per_demo, ks, out_dir):
-    """|D_pred| and |D*| per finger (and the arm) around the first contact, median and IQR over the demos, per K."""
-    fig, axes = plt.subplots(6, 2, figsize=(12, 14), sharex=True)
-    for c, k in enumerate(ks):
-        ds = [d for d in per_demo if d["K"] == k]
-        dt = ds[0]["dt"]
-        lag = np.arange(int(round(WINDOW[0] / dt)), int(round(WINDOW[1] / dt)) + 1)
-        t = lag * dt
-        for r in range(6):
-            pred_rows, star_rows = [], []
-            for d in ds:
-                if r < 5:
-                    yp, ys = np.linalg.norm(d["pred"][r], axis=-1), np.linalg.norm(d["star"][r], axis=-1)
-                else:
-                    yp, ys = np.abs(d["arm_pred"]).max(-1), np.zeros(d["T"])
-                idx = d["first"] + lag
-                ok = (idx >= 0) & (idx < d["T"])
-                wp, ws = np.full(len(lag), np.nan), np.full(len(lag), np.nan)
-                wp[ok], ws[ok] = yp[idx[ok]], ys[idx[ok]]
-                pred_rows.append(wp)
-                star_rows.append(ws)
-            ax = axes[r, c]
-            med, q1, q3 = band(pred_rows)
-            ax.fill_between(t, 1000 * q1, 1000 * q3, color=k_color(k), alpha=0.15, lw=0)
-            ax.plot(t, 1000 * med, color=k_color(k), label="policy: |a(K150) - a(K500)|")
-            med_s, q1_s, q3_s = band(star_rows)
-            ax.plot(t, 1000 * med_s, color=INK_2, linestyle="--", label="admittance law: |D*|")
-            ax.axvline(0.0, color=AXIS, linewidth=1.0)
-            name = FINGERS[r] + " (norm over 4 joints, clamped joints left out)" if r < 5 else "arm targets (largest joint)"
-            ax.set_title(f"{name}, demos K = {k:g}" if r == 0 or r == 5 else name)
-            ax.set_ylabel("mrad")
-    for ax in axes[-1]:
-        ax.set_xlabel("time relative to the demo's first contact [s]")
-    axes[0, 0].legend(loc="upper left")
-    fig.suptitle("K-swap on the demo states: change of the predicted command when only K is swapped, vs the "
-                 "admittance law\n(median and interquartile band over the demos; before contact the law gives 0)",
-                 x=0.01, ha="left", fontsize=11, fontweight="bold", color=INK)
-    fig.tight_layout()
-    save(fig, out_dir, "kswap_time")
-
-
-def plot_hold(per_demo, ks, out_dir, n_hold):
-    """Per finger, one dot per demo: hold medians of |D*| (x) and of D_pred's component along D* (y); y = x is the law."""
-    fig, axes = plt.subplots(1, 5, figsize=(17, 4.4))
-    for f, ax in enumerate(axes):
-        top = 0.0
-        for k in ks:
-            xs, ys, ys_raw = [], [], []
-            for d in (d for d in per_demo if d["K"] == k):
-                m = d["forces"][:, f] > CONTACT_N
-                m[:-n_hold(d)] = False
-                if m.sum() < 10:
-                    continue
-                s = d["star"][f][m]
-                ns = np.linalg.norm(s, axis=-1)
-                ok = ns > 1e-6
-                if not ok.any():
-                    continue
-                along = lambda p: np.median((p[m][ok] * s[ok]).sum(-1) / ns[ok])  # noqa: E731
-                xs.append(np.median(ns[ok]))
-                ys.append(along(d["pred_adj"][f]))
-                ys_raw.append(along(d["pred"][f]))
-            if xs:
-                x = 1000 * np.array(xs)
-                ax.scatter(x, 1000 * np.array(ys), s=22, color=k_color(k), alpha=0.75, linewidths=0,
-                           label=f"demos K = {k:g} (n = {len(xs)}), offset before contact removed")
-                ax.scatter(x, 1000 * np.array(ys_raw), s=22, facecolors="none", edgecolors=k_color(k), linewidths=0.8,
-                           alpha=0.6, label=f"demos K = {k:g}, raw")
-                top = max(top, float(x.max()))
-        top = max(top, 1.0) * 1.05
-        ax.plot([0, top], [0, top], color=INK_2, linestyle="--", linewidth=1.0, label="admittance law (y = x)")
-        ax.axhline(0.0, color=AXIS, linewidth=1.0)
-        ax.set_xlim(0, top)
-        ax.set_title(FINGERS[f])
-        ax.set_xlabel("law's change |D*| [mrad]")
-        if f == 0:
-            ax.set_ylabel("policy's change along D* [mrad]")
-    fig.legend(*axes[0].get_legend_handles_labels(), loc="lower center", ncol=5, bbox_to_anchor=(0.5, -0.06))
-    fig.suptitle(f"Hold (last {args.hold_s:g} s, finger in contact): one dot per demo (median over the hold); on the "
-                 "dashed line the policy changes its command with K exactly as the admittance law, at 0 it ignores K\n"
-                 "filled: with the policy's K offset from just before contact removed; hollow: raw",
-                 x=0.01, ha="left", fontsize=11, fontweight="bold", color=INK)
-    fig.tight_layout()
-    save(fig, out_dir, "kswap_hold")
+def save_arrays(per_demo, ks, path, attrs):
+    """Per-demo arrays for the plots (plot_il.py): /demos/K<K>_<demo>/ with
+    pred, pred_adj, star (T, 5, 4) [rad] (clamped joints set to 0), arm_pred (T, 6), forces (T, 5) [N];
+    the absolute commands act_first, act_ens (T, 2, 26) [rad] (index 1: K_lo, K_hi), act_rec (T, 26),
+    q_ref, dq, q_hand (T, 20), clamped (T, 20) (hand joints in the order of the attr hand_joints);
+    attrs K, first (first contact sample), dt. File attrs: K_lo, K_hi, split, temporal_ensemble,
+    chunk_size, arm_joints, hand_joints, demo_files, ..."""
+    with h5py.File(path, "w") as f:
+        f.attrs.update({"K_lo": ks[0], "K_hi": ks[1], "contact_n": CONTACT_N, "pre_n": PRE_N, "max_offset": MAX_OFFSET,
+                        **attrs})
+        g = f.create_group("demos")
+        for d in per_demo:
+            h = g.create_group(f"K{d['K']:g}_{d['name']}")
+            for key in ("pred", "pred_adj", "star"):
+                h.create_dataset(key, data=np.stack(d[key], axis=1).astype(np.float32))  # (T, 5, 4)
+            h.create_dataset("arm_pred", data=d["arm_pred"].astype(np.float32))
+            for key in ("act_first", "act_ens", "act_rec", "q_ref", "dq", "q_hand"):
+                h.create_dataset(key, data=np.asarray(d[key], np.float32))
+            h.create_dataset("clamped", data=d["clamped"])
+            h.create_dataset("forces", data=d["forces"].astype(np.float32))
+            h.attrs.update({"K": d["K"], "first": d["first"], "dt": d["dt"]})
 
 
 if __name__ == "__main__":

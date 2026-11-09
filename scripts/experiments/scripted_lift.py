@@ -33,6 +33,10 @@ per env. Two ways to use the script:
     python scripts/experiments/scripted_lift.py --headless --controller static \
         --stiffness 1 50 75 100 150 500 inf --video --video_env 3
 
+    # video from the palm camera of the IL recordings and rollouts (comparable with their videos)
+    python scripts/experiments/scripted_lift.py --headless --controller dynamic \
+        --stiffness 150 --video --video_env 0 --cam_palm
+
 The motion:
 
     settle    hold the start pose; fingers open, thumb in its grasp pose
@@ -82,10 +86,15 @@ parser.add_argument("--grasp_dy", type=float, nargs="+", default=None, help="ove
 parser.add_argument("--grasp_dz", type=float, nargs="+", default=None, help="override, base z [m]")
 parser.add_argument("--video", action="store_true", help="record a video of one environment")
 parser.add_argument("--video_env", type=int, default=0, help="which environment the video shows")
-parser.add_argument("--cam_eye", type=float, nargs=3, default=[0.85, 0.45, 0.30],
-                    help="video camera position relative to the env origin [m]")
-parser.add_argument("--cam_lookat", type=float, nargs=3, default=[0.50, 0.00, 0.08],
-                    help="point the video camera looks at, relative to the env origin [m] (the cube is at 0.5, 0, 0.02)")
+parser.add_argument("--cam_eye", type=float, nargs=3, default=None,
+                    help="video camera position [m], relative to the env origin (default 0.85 0.45 0.30) or, "
+                         "with --cam_palm, to the palm (default -0.25 0.12 0.20)")
+parser.add_argument("--cam_lookat", type=float, nargs=3, default=None,
+                    help="point the video camera looks at [m], relative to the env origin (default 0.50 0.00 0.08; "
+                         "the cube is at 0.5, 0, 0.02) or, with --cam_palm, to the palm (default 0.20 0.0 -0.10)")
+parser.add_argument("--cam_palm", action="store_true",
+                    help="camera follows the palm, as in the IL demo recordings and policy rollouts "
+                         "(teleop_lift.py / rollout_policy.py), so the videos can be compared")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 if args_cli.video:
@@ -201,10 +210,17 @@ def main():
         AdmittanceControllerCfg() if args_cli.controller == "dynamic" else StaticAdmittanceControllerCfg()
     )
     if args_cli.video:  # camera close to the hand of one environment
-        env_cfg.viewer.origin_type = "env"
         env_cfg.viewer.env_index = args_cli.video_env
-        env_cfg.viewer.eye = tuple(args_cli.cam_eye)
-        env_cfg.viewer.lookat = tuple(args_cli.cam_lookat)
+        if args_cli.cam_palm:  # the IL view: attached to the palm
+            env_cfg.viewer.origin_type = "asset_body"
+            env_cfg.viewer.asset_name = "robot"
+            env_cfg.viewer.body_name = "right_palm_link"
+            eye, lookat = (-0.25, 0.12, 0.20), (0.20, 0.0, -0.10)
+        else:
+            env_cfg.viewer.origin_type = "env"
+            eye, lookat = (0.85, 0.45, 0.30), (0.50, 0.00, 0.08)
+        env_cfg.viewer.eye = tuple(args_cli.cam_eye) if args_cli.cam_eye else eye
+        env_cfg.viewer.lookat = tuple(args_cli.cam_lookat) if args_cli.cam_lookat else lookat
         env_cfg.viewer.resolution = (1280, 720)
 
     stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")

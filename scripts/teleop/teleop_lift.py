@@ -41,7 +41,8 @@ Run (two terminals):
     python scripts/teleop/teleop_lift.py                     # admittance off (K = inf)
     python scripts/teleop/teleop_lift.py --stiffness 150     # with the admittance
     python scripts/teleop/teleop_lift.py --no_rotation       # hand keeps its orientation (position only)
-    python scripts/teleop/teleop_lift.py --stiffness 150 --record    # record demos at K = 150
+    python scripts/teleop/teleop_lift.py --stiffness 150 --record    # record training demos at K = 150
+    python scripts/teleop/teleop_lift.py --stiffness 150 --record --split val   # validation demos (own folder)
     python scripts/teleop/teleop_lift.py --stiffness 150 --video --cam_eye -0.25 0.12 0.20 --cam_lookat 0.20 0.0 -0.10
                                                                      # film every episode (no recording)
 
@@ -71,10 +72,17 @@ A demo whose real-time factor (simulated / wall time) is below --min_rtf is not 
 a slower pace than the simulated time suggests, which would distort the speeds in the data
 (claude/notes_imitation_learning.md, section 6).
 
-File layout (one file per stiffness, default logs/il_demos/lift_K<K>.hdf5; new demos are appended;
-a file whose "format" attribute differs, e.g. demos recorded before q_cmd was the action, is refused):
+Training or validation (--split): training demos go to logs/il_demos/, validation demos (never
+trained on; for checking a policy on demonstrations it has not seen) to logs/il_demos_val/, with
+the same file names. The split is stored as the file attribute "split"; appending to a file of the
+other split is refused (training files recorded before the attribute existed count as training).
+--dataset overrides the folder and file name; the attribute still follows --split.
 
-    /                     attrs: format, task, stiffness, controller, device, physics_dt, decimation,
+File layout (one file per stiffness, default logs/il_demos/lift_K<K>.hdf5, or
+logs/il_demos_val/lift_K<K>.hdf5 with --split val; new demos are appended; a file whose "format"
+attribute differs, e.g. demos recorded before q_cmd was the action, is refused):
+
+    /                     attrs: format, split, task, stiffness, controller, device, physics_dt, decimation,
                                  step_dt, lp_alpha, IK settings, success condition, obs_terms (name,
                                  start, end), arm_joints, hand_joints, created
     /data/demo_000/obs      (T, 51) float32
@@ -98,7 +106,8 @@ Video (--video): every episode is filmed from the moment the clutch engages (the
 starts) until the episode ends, from the GUI's camera (--cam_eye / --cam_lookat, so pass the view
 you want in the video; the IL recordings and policy rollouts use --cam_eye -0.25 0.12 0.20
 --cam_lookat 0.20 0.0 -0.10), one frame per env step (50 fps = real time). Files go to
-logs/il_demos/videos/ (next to --dataset): with --record and a saved demo <dataset name>_<demo>.mp4,
+videos/ next to the demo file (logs/il_demos/videos/, or logs/il_demos_val/videos/ with --split val):
+with --record and a saved demo <dataset name>_<demo>.mp4,
 otherwise teleop_K<K>_<date-time>_<outcome>.mp4 (success, time_limit, cube_off). Episodes ended with
 "r" or "q" are not kept. The frames come from the render the GUI does anyway; reading them out and
 encoding costs some time per step, so watch "real time x" in the status line (and --min_rtf when
@@ -137,8 +146,10 @@ parser.add_argument("--episode_s", type=float, default=300.0,
                     help="time limit of an episode [s] (the env's default is 60 s; longer for practising)")
 parser.add_argument("--print_every", type=int, default=50, help="status line every N env steps (50 = 1 s)")
 parser.add_argument("--record", action="store_true", help="save successful demos to --dataset")
+parser.add_argument("--split", choices=["train", "val"], default="train",
+                    help="training demos (logs/il_demos/) or validation demos (logs/il_demos_val/), see above")
 parser.add_argument("--dataset", default=None,
-                    help="HDF5 file for the demos (default logs/il_demos/lift_K<stiffness>.hdf5); appended to")
+                    help="HDF5 file for the demos (default <split folder>/lift_K<stiffness>.hdf5); appended to")
 parser.add_argument("--min_rtf", type=float, default=0.95,
                     help="demos recorded slower than this real-time factor are not saved")
 parser.add_argument("--video", action="store_true",
@@ -333,6 +344,12 @@ def rotvec_to_quat(rv: torch.Tensor) -> torch.Tensor:
 # recording: one HDF5 file, one group per successful demo
 # ------------------------------------------------------------------------------------------------
 
+# default folders of the demo files (and their videos) per split: the training set and a validation set
+# that is never trained on
+DEMO_DIRS = {"train": os.path.join("logs", "il_demos"), "val": os.path.join("logs", "il_demos_val")}
+SPLIT_NAME = {"train": "training", "val": "validation"}
+
+
 class DemoFile:
     """Appends demos to an HDF5 file (layout in the module docstring).
 
@@ -358,6 +375,11 @@ class DemoFile:
                     if not same:
                         raise SystemExit(f"[record] {path} was recorded with {k} = {old}, this run has {new}. "
                                          "Use another --dataset.")
+                # training and validation demos never share a file (files from before the attribute: training)
+                old_split = f.attrs.get("split", "train")
+                if old_split != attrs["split"]:
+                    raise SystemExit(f"[record] {path} holds {old_split} demos, this run records {attrs['split']} "
+                                     "demos. Check --split, or use another --dataset.")
             self.count = len(f["data"])
         self.saved: list[str] = []  # demos saved in this session, for "d" (delete the last one)
 
@@ -445,15 +467,17 @@ def main():
     tip_sensor = uw.scene["fingertip_contacts"]  # unfiltered: everything touching the fingertips
 
     # --- recording setup ---------------------------------------------------------------------------
+    demo_dir = DEMO_DIRS[args_cli.split]  # default folder of the demo files and videos
     demos: DemoFile | None = None
     if args_cli.record:
         if args_cli.stiffness not in STIFFNESS_VALUES:
             print(f"[record] WARNING: K = {args_cli.stiffness:g} is not one of the demo stiffnesses {STIFFNESS_VALUES}")
-        path = args_cli.dataset or os.path.join("logs", "il_demos", f"lift_K{args_cli.stiffness:g}.hdf5")
+        path = args_cli.dataset or os.path.join(demo_dir, f"lift_K{args_cli.stiffness:g}.hdf5")
         om = uw.observation_manager
         names, dims = om.active_terms["policy"], [d[0] for d in om.group_obs_term_dim["policy"]]
         ends = np.cumsum(dims).tolist()
         attrs = {
+            "split": args_cli.split,
             "task": TASK,
             "stiffness": float(args_cli.stiffness),
             "controller": args_cli.controller,
@@ -477,14 +501,13 @@ def main():
             "format": "actions = [arm targets | hand q_cmd]; per demo also q_ref, dq, tip_ref_offset, tip_force_raw",
         }
         demos = DemoFile(path, attrs)
-        print(f"[record] recording successful demos to {path} ({demos.count} already in it); "
+        print(f"[record] recording successful {SPLIT_NAME[args_cli.split]} demos to {path} ({demos.count} already in it); "
               f"a demo starts when the clutch engages, demos below x{args_cli.min_rtf} real time are not saved")
 
     rec: dict | None = None  # the demo being recorded: lists of obs and actions, start times
     episode_step = 0  # env steps since the last reset (for the idle time before the clutch)
     video: VideoWriter | None = None  # the episode being filmed
-    video_dir = os.path.join(os.path.dirname(args_cli.dataset) if args_cli.dataset else os.path.join("logs", "il_demos"),
-                             "videos")
+    video_dir = os.path.join(os.path.dirname(args_cli.dataset) if args_cli.dataset else demo_dir, "videos")
 
     def discard(why: str):
         nonlocal rec, video

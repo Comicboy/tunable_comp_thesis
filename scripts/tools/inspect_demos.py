@@ -26,11 +26,7 @@ and contact samples) [mrad/N]. At steady state e = f / K, so this should be clea
 K = 150 than at K = 500 (ideally ~500/150 = 3.3 times, less in practice: the joint posture, the
 admittance's dynamics and the clamp all enter). With two files the ratio is printed at the end.
 
---plot DIR draws, for the first --plot_demos demos of every file, the thumb's and the index
-finger's joint3 (q_ref, q_cmd, q) and their contact forces over time (needs matplotlib).
-
     python scripts/tools/inspect_demos.py logs/il_demos/lift_K150.hdf5 logs/il_demos/lift_K500.hdf5
-    python scripts/tools/inspect_demos.py logs/il_demos/test_K150.hdf5 --plot logs/il_demos/plots
 """
 
 import argparse
@@ -42,8 +38,6 @@ import numpy as np
 
 parser = argparse.ArgumentParser(description="Summarise and check IL demo files.")
 parser.add_argument("files", nargs="+", help="HDF5 demo files")
-parser.add_argument("--plot", default=None, help="folder for per-demo plots of q_ref, q_cmd, q and forces")
-parser.add_argument("--plot_demos", type=int, default=2, help="how many demos per file to plot")
 args = parser.parse_args()
 CONTACT_N = 0.5  # [N] per fingertip: counts as contact for the |dq| / |f| number
 dq_per_f = {}  # file -> median |dq| / |f| [rad/N]
@@ -132,8 +126,6 @@ def inspect(path: str) -> bool:
                     if r:
                         ratios.append(ratio)
                     extra = f" {1000 * np.abs(dq).max():>12.0f} {1000 * ratio:>11.1f} {clamped:>9.1f}"
-                if args.plot and demos.index(name) < args.plot_demos and not fails:
-                    plot_demo(path, name, dt, obs, sl, q_ref, q_cmd, hand, finger_idx)
             ok = not fails
             ok_all &= ok
             print(f"  {name:<9} {T:>5} {T * dt:>6.1f} {ga.get('rtf', float('nan')):>5.2f} {ga.get('idle_s', float('nan')):>6.1f} "
@@ -148,41 +140,6 @@ def inspect(path: str) -> bool:
             print(f"  admittance in the action: median |dq| / |f| = {1000 * dq_per_f[(path, k_file)]:.1f} mrad/N "
                   f"(fingers 2-5, in contact)")
     return ok_all
-
-
-def plot_demo(path, name, dt, obs, sl, q_ref, q_cmd, hand, finger_idx):
-    """Thumb and index joint3: q_ref (operator), q_cmd (sent to the drive), q (measured), and the fingertip force."""
-    import os
-
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    t = np.arange(len(obs)) * dt
-    q = obs[:, sl["hand_joint_pos"]]
-    f_tip = np.linalg.norm(obs[:, sl["fingertip_forces"]].reshape(len(obs), 5, 3), axis=-1)
-    fig, axes = plt.subplots(2, 2, figsize=(12, 6), sharex=True)
-    for c, (finger, label) in enumerate(((1, "thumb"), (2, "index"))):
-        j = hand.index(f"right_finger{finger}_joint3")
-        ax = axes[0, c]
-        ax.plot(t, q_ref[:, j], ":", color="#898781", label="q_ref (operator)")
-        ax.plot(t, q_cmd[:, j], "--", color="#2a78d6", label="q_cmd (action: sent to the drive)")
-        ax.plot(t, q[:, j], "-", color="#0b0b0b", linewidth=1.2, label="q (measured)")
-        ax.set_title(f"{label} joint3")
-        ax.set_ylabel("rad")
-        ax.legend(fontsize=7)
-        axes[1, c].plot(t, f_tip[:, finger - 1], color="#eb6834")
-        axes[1, c].set_title(f"{label} contact force (smoothed)")
-        axes[1, c].set_ylabel("N")
-        axes[1, c].set_xlabel("time [s]")
-    fig.suptitle(f"{os.path.basename(path)} {name}", x=0.01, ha="left", fontweight="bold")
-    fig.tight_layout()
-    os.makedirs(args.plot, exist_ok=True)
-    out = os.path.join(args.plot, f"{os.path.splitext(os.path.basename(path))[0]}_{name}.png")
-    fig.savefig(out, dpi=140)
-    plt.close(fig)
-    print(f"  [plot] {out}")
 
 
 all_ok = True

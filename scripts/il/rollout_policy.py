@@ -135,7 +135,11 @@ parser.add_argument("--push_force", type=float, default=2.0, help="push force on
 parser.add_argument("--push_after_s", type=float, default=1.0, help="push after the cube has been held this long [s]")
 parser.add_argument("--push_still_s", type=float, default=0.5,
                     help="...and the cube has been still this long (the lift is over) [s]")
-parser.add_argument("--push_still_speed", type=float, default=0.01, help="'still': cube speed below this [m/s]")
+parser.add_argument("--push_still_speed", type=float, default=0.01,
+                    help="'still': the cube's mean speed over --push_still_s below this [m/s]")
+parser.add_argument("--push_max_wait_s", type=float, default=3.0,
+                    help="push anyway when the cube has been held this much longer than --push_after_s without "
+                    "being still (the mean speed at the push is recorded) [s]")
 parser.add_argument("--push_s", type=float, default=2.0,
                     help="push duration [s] (with temporal ensembling the policy averages ~2 s of predictions)")
 parser.add_argument("--release_s", type=float, default=2.0, help="keep running this long after the release [s]")
@@ -313,7 +317,8 @@ def main():
     }
     if args_cli.push:
         file_attrs["push"] = json.dumps({k: getattr(args_cli, k) for k in (
-            "push_force", "push_after_s", "push_still_s", "push_still_speed", "push_s", "release_s", "push_dirs",
+            "push_force", "push_after_s", "push_still_s", "push_still_speed", "push_max_wait_s", "push_s", "release_s",
+            "push_dirs",
             "push_conditions")})
     if traj is not None:
         os.makedirs(os.path.dirname(os.path.abspath(traj)), exist_ok=True)
@@ -463,6 +468,7 @@ def push_test(env, uw, client, episodes, place_cube, hold, settle_steps, state_i
     palm_id = robot.find_bodies(PALM)[0][0]
     after_steps = max(1, int(round(args_cli.push_after_s / dt)))
     still_steps = max(1, int(round(args_cli.push_still_s / dt)))
+    wait_steps = int(round(args_cli.push_max_wait_s / dt))
     push_steps = int(round(args_cli.push_s / dt))
     release_steps = int(round(args_cli.release_s / dt))
     win = int(round(WINDOW_S / dt))
@@ -544,7 +550,9 @@ def push_test(env, uw, client, episodes, place_cube, hold, settle_steps, state_i
 
     def until_push(ep, direction, video):
         """The policy from the episode start until the cube has been held at the success height for
-        --push_after_s and has been still (speed < --push_still_speed) for --push_still_s."""
+        --push_after_s and its mean speed over the last --push_still_s is below --push_still_speed (a mean over
+        a window, not the instantaneous speed, which jitters with the contacts), or at the latest
+        --push_max_wait_s after that."""
         hand.cfg.admittance_enabled = False
         obs, _ = env.reset()
         set_push(None)
@@ -553,17 +561,24 @@ def push_test(env, uw, client, episodes, place_cube, hold, settle_steps, state_i
             obs, *_ = env.step(hold)
         client.call(cmd="reset")
         log = {k: [] for k in log_keys}
-        held = still = 0
+        held = max_held = 0
+        min_speed = float("inf")
         last_action = None
+        cube_path = []  # cube positions, for its mean speed over the last --push_still_s
         while True:
             o = obs["policy"][0].cpu().numpy().astype(float)
             held = held + 1 if o[cube_z] - CUBE_HALF_SIZE >= height - tolerance else 0
-            still = still + 1 if float(cube.data.root_lin_vel_w[0].norm()) < args_cli.push_still_speed else 0
-            if held >= after_steps and still >= still_steps:
+            cube_path.append(cube.data.root_link_pos_w[0].cpu().numpy().astype(float))
+            speed = (float(np.linalg.norm(cube_path[-1] - cube_path[-1 - still_steps])) / (still_steps * dt)
+                     if len(cube_path) > still_steps else float("inf"))
+            max_held = max(max_held, held)
+            if held >= after_steps:
+                min_speed = min(min_speed, speed)
+            if held >= after_steps and (speed < args_cli.push_still_speed or held >= after_steps + wait_steps):
                 d = push_direction(direction)
                 if d is None:
                     return "no grip to push against", None
-                return None, {"obs": obs, "o": o, "log": log, "last_action": last_action, "d": d,
+                return None, {"obs": obs, "o": o, "log": log, "last_action": last_action, "d": d, "speed": speed,
                               "state": copy_state(uw.scene.get_state(is_relative=False)),
                               "f_filt": ctrl._f_filt.clone(), "joint_cmd": hand.joint_command.clone()}
             rep = client.call(cmd="act", state=o[state_idx].tolist(), env_state=o[env_idx].tolist())
@@ -574,7 +589,8 @@ def push_test(env, uw, client, episodes, place_cube, hold, settle_steps, state_i
             record(log, o, action, 0, None, None)
             obs, ended = step(log, action)
             if ended:
-                return ended + " before the push", None
+                return (f"{ended} before the push (cube at the success height for {max_held * dt:.1f} s at most, "
+                        f"lowest mean speed there {1000 * min_speed:.1f} mm/s)"), None
 
     def copy_state(state):
         return {k: {n: {q: v.clone() for q, v in d.items()} for n, d in grp.items()} for k, grp in state.items()}
@@ -658,7 +674,7 @@ def push_test(env, uw, client, episodes, place_cube, hold, settle_steps, state_i
                     results.append({"episode": ep, "direction": direction, "condition": None, "outcome": failed})
                     for v in videos.values():
                         v.close()
-                    if failed.endswith("before the push"):
+                    if "before the push" in failed:
                         break  # the same in the other direction (identical until the push)
                     continue
                 for cond in conds:
@@ -666,14 +682,15 @@ def push_test(env, uw, client, episodes, place_cube, hold, settle_steps, state_i
                     arr = {k: np.stack(v) for k, v in log.items()}
                     d = snap["d"].cpu().numpy()
                     r = {"episode": ep, "direction": direction, "condition": cond, "outcome": outcome,
-                         "push_start": ps, "push_end": pe, "push_dir": d.tolist()}
+                         "push_start": ps, "push_end": pe, "push_dir": d.tolist(), "speed_at_push": snap["speed"]}
                     if outcome == "done":
                         r.update(summary(arr, ps, pe, d))
                         print(f"[push] ep {ep:3d} {direction:<5} {cond:<7} cube {r['dx_push_mm']:+6.2f} mm "
                               f"(k {r['k_grasp']:6.0f} N/m), after release {r['dx_after_mm']:+6.2f} mm | thumb "
                               f"{r['f_pre'][0]:5.2f} N {r['df_push'][0]:+5.2f} / {r['df_after'][0]:+5.2f} | "
                               f"fingers 2-5 {r['f_pre'][1]:5.2f} N {r['df_push'][1]:+5.2f} / {r['df_after'][1]:+5.2f}"
-                              f" | first step {r['df_first_step'][0]:+5.2f} / {r['df_first_step'][1]:+5.2f} N")
+                              f" | first step {r['df_first_step'][0]:+5.2f} / {r['df_first_step'][1]:+5.2f} N"
+                              f" | cube speed at the push {1000 * snap['speed']:.1f} mm/s")
                     else:
                         print(f"[push] ep {ep:3d} {direction:<5} {cond:<7} {outcome}")
                     results.append(r)
@@ -684,7 +701,7 @@ def push_test(env, uw, client, episodes, place_cube, hold, settle_steps, state_i
                                 g.create_dataset(k, data=v)
                             g.attrs.update({"episode": ep, "direction": direction, "condition": cond,
                                             "outcome": outcome, "push_start": ps, "push_end": -1 if pe is None else pe,
-                                            "push_dir": json.dumps(r["push_dir"])})
+                                            "push_dir": json.dumps(r["push_dir"]), "speed_at_push": snap["speed"]})
                 for v in videos.values():
                     v.close()
     results = [r for r in results if r["condition"] is None or r["condition"] in args_cli.push_conditions]

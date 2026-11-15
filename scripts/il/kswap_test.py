@@ -87,6 +87,12 @@ import torch  # noqa: E402
 from lerobot.configs.policies import PreTrainedConfig  # noqa: E402
 from lerobot.policies import get_policy_class, make_pre_post_processors  # noqa: E402
 
+# project policy types (LeRobot plugins in scripts/il/lerobot_plugins): importing registers them, so
+# their checkpoints load like ACT ones (e.g. act_ktoken: ACT with the stiffness as its own token)
+import sys  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent / "lerobot_plugins"))  # noqa: E402
+import act_ktoken  # noqa: F401,E402
+
 parser = argparse.ArgumentParser(description="Offline K-swap test of a q_cmd policy on the demo states.")
 parser.add_argument("--policy", required=True, help="checkpoint folder (…/checkpoints/<step>/pretrained_model)")
 parser.add_argument("--demos", nargs=2, required=True, help="the two demo files (one per K)")

@@ -39,6 +39,12 @@ from lerobot.configs.policies import PreTrainedConfig
 from lerobot.policies import get_policy_class, make_pre_post_processors
 from lerobot.policies.utils import prepare_observation_for_inference
 
+# project policy types (LeRobot plugins in scripts/il/lerobot_plugins): importing registers them, so
+# their checkpoints load like ACT ones (e.g. act_ktoken: ACT with the stiffness as its own token)
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent / "lerobot_plugins"))
+import act_ktoken  # noqa: F401,E402
+
 parser = argparse.ArgumentParser(description="Serve a LeRobot policy to the Isaac Lab rollout script.")
 parser.add_argument("--policy", required=True, help="checkpoint folder with config.json + model.safetensors "
                     "(…/checkpoints/<step>/pretrained_model)")

@@ -42,7 +42,13 @@ force); scripted lift: everything logged after the step.
 Output (PNG, --out, default logs/il_eval/figures/<rollout name>/), each with a short title; the
 explanation is in captions.md:
     outcome              task outcome per K
-    hold_force           grip force in the hold per finger, demonstrations vs policy
+    hold_force           grip force and command penetration in the hold per finger, demonstrations vs policy (one
+                         marker per episode; the demonstrations' median reference penetration as a dashed bar with
+                         an arrow down to the median command: the yield)
+    hold_share           the policy's hold force as a share of the demonstrations' per finger and K (ratio of the means)
+    grip_timeline        force and cube height over time, all successful episodes aligned at the lift-off (or at the
+                         end, --timeline_align end), median and interquartile range per K, demos vs policy
+    penetration_timeline the same for the command penetration (samples in contact)
     admittance_law       yield vs contact force (scripted lift, demonstrations), the law e = f / K
     penetration          contact force vs reference and command penetration, one marker per episode (scripted
                          lift, demonstrations, policy); the gap between the two is the yield
@@ -74,8 +80,8 @@ from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 
 from plot_style import (  # noqa: F401  (shared look and statistics, scripts/plots/plot_style.py)
-    AXIS, FINGER_COLOR, FINGERS, GRID, INK, INK_2, MUTED, RIGID, SURFACE, band, k_shade, layout, mcnemar, quiet,
-    suptitle, wilson,
+    AXIS, FINGER_COLOR, FINGERS, GRID, INK, INK_2, MUTED, PHASE_BAND, RIGID, SURFACE, aligned, band, k_shade, layout,
+    mcnemar, quiet, suptitle, wilson,
 )
 from plot_style import ratio_ci as _ratio_ci
 from plot_style import save as _save
@@ -95,6 +101,13 @@ parser.add_argument("--pair_episode", type=int, default=None, help="rollout epis
                     "both K successful, cube closest to the spawn centre)")
 parser.add_argument("--hold_s", type=float, default=3.0, help="hold window: the last hold_s of a successful episode "
                     "[s] (3 s = the success hold)")
+parser.add_argument("--timeline_align", choices=["liftoff", "end"], default="liftoff",
+                    help="grip_timeline: align the episodes at the cube's lift-off or at their end (success)")
+parser.add_argument("--timeline_window", type=float, nargs=2, default=None, metavar=("FROM", "TO"),
+                    help="grip_timeline: time window around the alignment point [s] (default -1.5 6 at the lift-off, "
+                    "-6 0 at the end)")
+parser.add_argument("--timeline_share", type=float, default=0.5, help="grip_timeline: a time is shown only while at "
+                    "least this share of the episodes is still running (and, for the penetration, half of those in contact)")
 parser.add_argument("--window_s", type=float, default=0.5, help="scripted lift: window at the end of the squeeze and the hold [s]")
 parser.add_argument("--contact_n", type=float, default=0.5, help="a fingertip counts as in contact above this force [N]")
 parser.add_argument("--boot", type=int, default=2000, help="bootstrap resamples")
@@ -125,7 +138,11 @@ IL_KS = ()  # the two stiffnesses of the demonstrations (set in main)
 
 ROLES = {  # what each figure answers (written into captions.md)
     "outcome": "Task performance of the policy",
-    "hold_force": "(a) Does the policy reproduce the stiffness-dependent grip of the demonstrations?",
+    "hold_force": "(a) Does the policy reproduce the stiffness-dependent grip of the demonstrations, in force and in "
+                  "command depth?",
+    "hold_share": "(a) How much of the demonstrations' grip force the policy applies",
+    "grip_timeline": "(a) How the grip force develops over time, demonstrations vs policy",
+    "penetration_timeline": "(a) How the command depth develops over time, demonstrations vs policy",
     "force_ratio": "(a) Does the policy reproduce the stiffness-dependent grip of the demonstrations?",
     "single_rollouts": "(a), one example",
     "penetration": "(a) How the force arises: the command depth on the drives' characteristic",
@@ -205,6 +222,7 @@ def episode(src, K, name, dt, success, q, q_cmd, f, J, cols, drive, h=None, d_re
     if h is not None:
         up = np.nonzero(h > LIFTOFF_M)[0]
         ep["liftoff"] = int(up[0]) if up.size else None
+    ep["last"] = ep["T"] - 1  # alignment point "end" of grip_timeline
     return ep
 
 
@@ -385,53 +403,335 @@ def fig_outcome(stats, mc):
          f"exact McNemar p = {mc['p']:.2f}.")
 
 
+def hold_values(demos, rolls):
+    """Per group (source, K index): the hold force of every successful episode (n, 5) [N], and per finger the command
+    and reference penetration [mm] of the episodes with that finger in contact in the hold (episode_medians)."""
+    out = {}
+    for src, sets in (("demo", demos), ("policy", rolls)):
+        for i in (0, 1):
+            eps = successful(sets[i])
+            force = np.array([np.median(e["fn"][hold_idx(e)], axis=0) for e in eps]).reshape(-1, 5)
+            cmd, ref = [], []
+            for f in range(5):
+                ms = [m for m in (episode_medians(e, f) for e in eps) if m is not None]
+                cmd.append(1000 * np.array([m["p_cmd"] for m in ms]))
+                ref.append(1000 * np.array([m["p_ref"] for m in ms if "p_ref" in m]))
+            out[(src, i)] = {"force": force, "cmd": cmd, "ref": ref}
+    return out
+
+
+def group_stats(lo, hi, min_median):
+    """Median and IQR of two groups (K low, K high) and the ratio of the medians hi / lo [95 % bootstrap]."""
+    nan = float("nan")
+    med = lambda a: float(np.median(a)) if len(a) else nan  # noqa: E731
+    iqr = lambda a: np.percentile(a, [25, 75]).tolist() if len(a) else [nan, nan]  # noqa: E731
+    ok = len(lo) >= 3 and len(hi) >= 3
+    return {"median": [med(lo), med(hi)], "iqr": [iqr(lo), iqr(hi)], "n": [len(lo), len(hi)],
+            "ratio": ratio_ci(lo, hi, min_median=min_median) if ok else (nan, nan, nan)}
+
+
+def share_ci(d, p, stat, min_den):
+    """stat(p) / stat(d), the policy as a share of the demonstrations, with a 95 % bootstrap (episodes resampled
+    within each group). NaN with fewer than 3 episodes per group or stat(d) < min_den; a resample whose denominator
+    falls below min_den counts as infinite, so an unstable ratio shows an open upper bound instead of a huge number."""
+    nan = float("nan")
+    d, p = np.asarray(d, float), np.asarray(p, float)
+    if len(d) < 3 or len(p) < 3 or stat(d) < min_den:
+        return [nan, nan, nan]
+    rng = np.random.default_rng(0)
+    b = np.empty(args.boot)
+    for i in range(args.boot):
+        den = stat(rng.choice(d, len(d)))
+        b[i] = stat(rng.choice(p, len(p))) / den if den >= min_den else np.inf
+    return [float(stat(p) / stat(d)), float(np.percentile(b, 2.5)), float(np.percentile(b, 97.5))]
+
+
+def policy_vs_demo(d, p, min_median):
+    """The policy against the demonstrations at one K: difference of the medians (policy - demos) and their ratio
+    policy / demos [95 % bootstrap]."""
+    nan = float("nan")
+    diff = float(np.median(p) - np.median(d)) if len(d) >= 3 and len(p) >= 3 else nan
+    return {"diff": diff, "ratio": share_ci(d, p, np.median, min_median), "n": [len(d), len(p)]}
+
+
 def fig_hold_force(demos, rolls, tables):
-    """Hold force per finger and of fingers 2-5 together, demonstrations vs policy, one dot per episode."""
+    """Hold force (top) and command penetration (bottom) per finger, demonstrations vs policy, one marker per episode;
+    the demonstrations' reference penetration as an arrow down to their command (the yield)."""
     ks = [demos[0]["K"], demos[1]["K"]]
     groups = [("demo", 0), ("demo", 1), ("policy", 0), ("policy", 1)]
-    vals = {}
-    for src, i in groups:
-        s = (demos if src == "demo" else rolls)[i]
-        rows = [np.median(e["fn"][hold_idx(e)], axis=0) for e in successful(s)]
-        vals[(src, i)] = np.array(rows).reshape(-1, 5)
-    cols = TITLES + ["Fingers 2–5 (sum)"]
-    fig, axes = plt.subplots(1, 6, figsize=(16, 3.9))
+    xpos = {g: xi + (0.5 if g[0] == "policy" else 0.0) for xi, g in enumerate(groups)}
+    v = hold_values(demos, rolls)
+    fig, axes = plt.subplots(2, 6, figsize=(16, 7.6))
     jit = np.random.default_rng(1)
-    rec = {}
-    for c, ax in enumerate(axes):
-        for xi, (src, i) in enumerate(groups):
-            v = vals[(src, i)][:, c] if c < 5 else vals[(src, i)][:, 1:].sum(-1)
-            x = xi + (0.5 if src == "policy" else 0.0)
-            ax.scatter(x + jit.uniform(-0.15, 0.15, len(v)), v, s=14, marker=SRC_MARKER[src],
-                       color=k_shade(ks[i]), alpha=0.6, linewidths=0, zorder=3)
-            ax.plot([x - 0.28, x + 0.28], [np.median(v)] * 2, color=INK, linewidth=2.0, zorder=4)
+    rec, rec_p, vs = {}, {}, {}
+
+    def column(ax, data):
+        for g in groups:
+            y = data[g]
+            if not len(y):
+                continue
+            x = xpos[g]
+            ax.scatter(x + jit.uniform(-0.15, 0.15, len(y)), y, s=14, marker=SRC_MARKER[g[0]], color=k_shade(ks[g[1]]),
+                       alpha=0.6, linewidths=0, zorder=3)
+            ax.plot([x - 0.28, x + 0.28], [np.median(y)] * 2, color=INK, linewidth=2.0, zorder=4)
         ax.set_xticks([0.5, 3.0], ["Demos", "Policy"])
         ax.set_xlim(-0.6, 4.1)
         ax.grid(axis="x", visible=False)
+
+    # top: contact force, per finger and fingers 2-5 together
+    for c in range(6):
+        ax = axes[0, c]
+        get = (lambda g, c=c: v[g]["force"][:, c]) if c < 5 else (lambda g: v[g]["force"][:, 1:].sum(-1))
+        column(ax, {g: get(g) for g in groups})
         ax.set_ylim(bottom=0)
-        ax.set_title(cols[c])
+        ax.set_title((TITLES + ["Fingers 2–5 (sum)"])[c])
         name = (FINGERS + ["fingers 2-5"])[c]
         for src in ("demo", "policy"):
-            lo = vals[(src, 0)][:, c] if c < 5 else vals[(src, 0)][:, 1:].sum(-1)
-            hi = vals[(src, 1)][:, c] if c < 5 else vals[(src, 1)][:, 1:].sum(-1)
-            rec[f"{src} | {name}"] = {"median": [float(np.median(lo)), float(np.median(hi))],
-                                      "iqr": [np.percentile(lo, [25, 75]).tolist(), np.percentile(hi, [25, 75]).tolist()],
-                                      "n": [len(lo), len(hi)], "ratio": ratio_ci(lo, hi, min_median=0.5)}
-    axes[0].set_ylabel(r"Contact force $\Vert f\Vert$ [N]")
+            rec[f"{src} | {name}"] = group_stats(get((src, 0)), get((src, 1)), 0.5)
+    # bottom: command penetration per finger (no sum: it is a per-fingertip depth)
+    for f in range(5):
+        ax = axes[1, f]
+        column(ax, {g: v[g]["cmd"][f] for g in groups})
+        for i in (0, 1):
+            r, cm = v[("demo", i)]["ref"][f], v[("demo", i)]["cmd"][f]
+            if len(r) and len(cm):
+                # a different quantity from the dots: the operator's reference, not the command
+                x, col, rm = xpos[("demo", i)], k_shade(ks[i]), float(np.median(r))
+                ax.plot([x - 0.28, x + 0.28], [rm, rm], color=col, linewidth=1.8, linestyle=(0, (2.0, 1.4)), zorder=6)
+                ax.text(x + 0.31, rm, "ref", ha="left", va="center", fontsize=8.5, color=INK_2)
+                ax.annotate("", xy=(x, np.median(cm)), xytext=(x, rm), zorder=5,
+                            arrowprops=dict(arrowstyle="-|>", color=col, linewidth=1.3, shrinkA=1, shrinkB=2))
+        lo_, hi_ = ax.get_ylim()
+        ax.set_ylim(min(0.0, lo_), hi_)
+        for src in ("demo", "policy"):
+            st = group_stats(v[(src, 0)]["cmd"][f], v[(src, 1)]["cmd"][f], 1.0)
+            if src == "demo":
+                st["ref_median"] = [float(np.median(v[(src, i)]["ref"][f])) if len(v[(src, i)]["ref"][f])
+                                    else float("nan") for i in (0, 1)]
+            rec_p[f"{src} | {FINGERS[f]}"] = st
+        vs[f"delta_cmd | {FINGERS[f]}"] = [policy_vs_demo(v[("demo", i)]["cmd"][f], v[("policy", i)]["cmd"][f], 1.0)
+                                           for i in (0, 1)]
+    axes[0, 0].set_ylabel(r"Contact force $\Vert f\Vert$ [N]")
+    axes[1, 0].set_ylabel(r"Command penetration $\delta_{\mathrm{cmd}}$ [mm]")
+    axes[1, 5].axis("off")
     hs = [Line2D([], [], marker=SRC_MARKER[s], linestyle="", color=MUTED, label=SRC_LABEL[s]) for s in ("demo", "policy")]
     hs += [Patch(color=k_shade(k), label=f"K = {k:g} N/m") for k in ks]
-    hs += [Line2D([], [], color=INK, linewidth=2, label="Median")]
-    fig.legend(handles=hs, loc="lower center", ncol=5, bbox_to_anchor=(0.5, -0.02))
-    suptitle(fig, "Grip force in the hold")
-    layout(fig, 0.1)
+    hs += [Line2D([], [], color=INK, linewidth=2, label="Median over the episodes"),
+           Line2D([], [], color=MUTED, linewidth=1.8, linestyle=(0, (2.0, 1.4)),
+                  label="Demos: median reference\n" + r"penetration $\delta_{\mathrm{ref}}$ ('ref');" + "\narrow: the yield")]
+    axes[1, 5].legend(handles=hs, loc="center left", frameon=False)
+    suptitle(fig, "Grip force and command penetration in the hold")
+    layout(fig)
     tables["hold_force"] = rec
-    n_d, n_p = [len(vals[("demo", i)]) for i in (0, 1)], [len(vals[("policy", i)]) for i in (0, 1)]
+    tables["hold_penetration"] = rec_p
+    tables["hold_policy_vs_demo"] = vs
+    n_d = [len(v[("demo", i)]["force"]) for i in (0, 1)]
+    n_p = [len(v[("policy", i)]["force"]) for i in (0, 1)]
     save(fig, "hold_force",
-         f"Contact force between the cube and each fingertip while the cube is held: one marker per successful "
-         f"episode (median over its last {args.hold_s:g} s), demonstrations (n = {n_d[0]} / {n_d[1]}) and policy "
-         f"rollouts (n = {n_p[0]} / {n_p[1]}) at K = {ks[0]:g} and {ks[1]:g} N/m; bars: medians. Only the normal force "
-         "from the cube on the fingertip links is measured (not friction, not contacts of other finger segments, "
-         "the palm or the table).")
+         f"The grip while the cube is held: one marker per successful episode (median over its last {args.hold_s:g} s), "
+         f"demonstrations (n = {n_d[0]} / {n_d[1]}) and policy rollouts (n = {n_p[0]} / {n_p[1]}) at K = {ks[0]:g} and "
+         f"{ks[1]:g} N/m; bars: medians over the episodes. Top: contact force between the cube and each fingertip "
+         "(only the normal force from the cube on the fingertip links is measured: not friction, not contacts of "
+         "other finger segments, the palm or the table). Bottom: command penetration delta_cmd, the component of "
+         "J (q_cmd - q) along -f, i.e. how deep the commanded fingertip lies inside the cube (what the drives turn "
+         "into force); per episode over the hold samples with the finger in contact, only episodes with the finger "
+         "in contact in the hold. Dashed bar marked 'ref' (demonstrations only): the median reference "
+         "penetration delta_ref, a different quantity from the markers (the operator's hand, before the admittance); "
+         "the arrow down to the median command is the yield the admittance takes off it. The "
+         "policy has no reference; it outputs the command directly. Where a joint drive is saturated, a deeper "
+         "command adds no force (see drive_relation).")
+
+
+def band_running(rows, share):
+    """Median, 25th and 75th percentile over the episodes (rows) at each time; NaN where fewer than
+    max(3, share * n) episodes have data (so the curve does not end on the few longest episodes)."""
+    m = np.array(rows, float)
+    enough = (~np.isnan(m)).sum(0) >= max(3, int(math.ceil(share * len(m))))
+    return tuple(np.where(enough, quiet(np.nanpercentile, m, p, 0), np.nan) for p in (50, 25, 75))
+
+
+def timeline_window():
+    """Alignment key, time window [s], lags [samples] and times [s] of the timeline figures."""
+    align = args.timeline_align
+    w = args.timeline_window or ((-1.5, 6.0) if align == "liftoff" else (-6.0, 0.0))
+    return align, w, "liftoff" if align == "liftoff" else "last"
+
+
+def timeline_groups(demos, rolls, key):
+    """(source, K, successful episodes with an alignment point) for the four groups."""
+    for src, sets in (("demo", demos), ("policy", rolls)):
+        for s_ in sets:
+            yield src, s_["K"], [e for e in successful(s_) if e.get(key) is not None]
+
+
+TL_STYLE = {"demo": dict(linestyle="-", linewidth=1.8), "policy": dict(linestyle="--", linewidth=1.8)}
+
+
+def timeline_finish(fig, axes, align, w, legend_ax, ks, title, name, caption, ylabels):
+    xlabel = "Time from the lift-off [s]" if align == "liftoff" else "Time to the end (success) [s]"
+    for ax in axes:
+        if align == "end":
+            ax.axvspan(-args.hold_s, 0, color=PHASE_BAND, zorder=0, lw=0)
+        ax.axvline(0, color=AXIS, linewidth=1.0, zorder=1)
+        ax.set_xlim(*w)
+        ax.set_xlabel(xlabel)
+    for ax, lab in ylabels:
+        ax.set_ylabel(lab)
+    hs = [Line2D([], [], color=MUTED, label=SRC_LABEL["demo"], **TL_STYLE["demo"]),
+          Line2D([], [], color=MUTED, label=SRC_LABEL["policy"], **TL_STYLE["policy"])]
+    hs += [Patch(color=k_shade(k), label=f"K = {k:g} N/m") for k in ks]
+    hs += [Patch(color=MUTED, alpha=0.25, label="Interquartile range")]
+    if align == "end":
+        hs.append(Patch(color=PHASE_BAND, label=f"Hold (last {args.hold_s:g} s)"))
+    legend_ax.axis("off")
+    legend_ax.legend(handles=hs, loc="center left", frameon=False)
+    suptitle(fig, title + (", aligned at the lift-off" if align == "liftoff" else ", aligned at the end"))
+    layout(fig)
+    save(fig, name, caption)
+
+
+def timeline_caption_head(align, counts, ks, share):
+    ref = ("the cube's lift-off (its bottom first more than 5 mm above the table)" if align == "liftoff"
+           else "their end (the success: the cube held for 3 s; shaded: the hold window of hold_force)")
+    n = lambda src, k: counts.get(f"{src} | {k:g}", 0)  # noqa: E731
+    return (f"All successful episodes aligned at {ref}: median (line) and interquartile range (band) over the "
+            f"episodes, demonstrations (solid; n = {n('demo', ks[0])} / {n('demo', ks[1])}) and policy rollouts (dashed; "
+            f"n = {n('policy', ks[0])} / {n('policy', ks[1])}) at K = {ks[0]:g} and {ks[1]:g} N/m. A time is shown while "
+            f"at least {100 * share:.0f} % of the episodes are still running (episodes have different lengths).")
+
+
+def fig_grip_timeline(demos, rolls, tables):
+    """Contact force over time (per finger, fingers 2-5 together) and the cube height: all successful episodes
+    aligned at the lift-off (or at their end), median and IQR per source and K."""
+    align, w, key = timeline_window()
+    dt = demos[0]["dt"]
+    lag = np.arange(int(round(w[0] / dt)), int(round(w[1] / dt)) + 1)
+    t = lag * dt
+    ks = [demos[0]["K"], demos[1]["K"]]
+    fig, axes = plt.subplots(2, 4, figsize=(16, 7.6))
+    panels = list(axes[0]) + list(axes[1, :3])  # thumb, index, middle, ring | little, fingers 2-5, cube height
+    counts = {}
+    for src, k, eps in timeline_groups(demos, rolls, key):
+        counts[f"{src} | {k:g}"] = len(eps)
+        if len(eps) < 3:
+            continue
+        fns = [lambda e, c=c: e["fn"][:, c] for c in range(5)] + [lambda e: e["fn"][:, 1:].sum(-1),
+                                                                  lambda e: 100 * e["h"]]
+        for ax, fn in zip(panels, fns):
+            med, q1, q3 = band_running(aligned(eps, fn, key, lag), args.timeline_share)
+            ax.fill_between(t, q1, q3, color=k_shade(k), alpha=0.10, lw=0)
+            ax.plot(t, med, color=k_shade(k), **TL_STYLE[src])
+    for ax, title in zip(panels, TITLES + ["Fingers 2–5 (sum)", "Cube height"]):
+        ax.set_title(title)
+        ax.set_ylim(bottom=0)
+    tables["grip_timeline"] = {"align": align, "window_s": list(w), "share": args.timeline_share, "episodes": counts}
+    timeline_finish(fig, panels, align, w, axes[1, 3], ks, "Grip force over time", "grip_timeline",
+                    timeline_caption_head(align, counts, ks, args.timeline_share)
+                    + " Panels: contact force per fingertip, of fingers 2–5 together, and the cube height (bottom above "
+                    "the table).",
+                    [(axes[0, 0], r"Contact force $\Vert f\Vert$ [N]"), (axes[1, 0], r"Contact force $\Vert f\Vert$ [N]"),
+                     (axes[1, 2], "Cube bottom above the table [cm]")])
+
+
+def fig_penetration_timeline(demos, rolls, tables):
+    """Command penetration over time per finger, from the samples in contact, aligned as grip_timeline."""
+    align, w, key = timeline_window()
+    dt = demos[0]["dt"]
+    lag = np.arange(int(round(w[0] / dt)), int(round(w[1] / dt)) + 1)
+    t = lag * dt
+    ks = [demos[0]["K"], demos[1]["K"]]
+    share = args.timeline_share
+    fig, axes = plt.subplots(2, 3, figsize=(13, 7.6))
+    panels = list(axes[0]) + list(axes[1, :2])
+    counts = {}
+    for src, k, eps in timeline_groups(demos, rolls, key):
+        counts[f"{src} | {k:g}"] = len(eps)
+        if len(eps) < 3:
+            continue
+        # shown while at least half of the running episodes have the finger in contact
+        running = (~np.isnan(np.array(aligned(eps, lambda e: np.zeros(e["T"]), key, lag)))).sum(0)
+        for f, ax in enumerate(panels):
+            m = np.array(aligned(eps, lambda e, f=f: np.where(e["fn"][:, f] > args.contact_n, 1000 * e["p_cmd"][:, f],
+                                                             np.nan), key, lag))
+            on = (~np.isnan(m)).sum(0)
+            ok = (running >= max(3, int(math.ceil(share * len(eps))))) & (on >= 3) & (on >= 0.5 * running)
+            med, q1, q3 = (np.where(ok, quiet(np.nanpercentile, m, p, 0), np.nan) for p in (50, 25, 75))
+            ax.fill_between(t, q1, q3, color=k_shade(k), alpha=0.10, lw=0)
+            ax.plot(t, med, color=k_shade(k), **TL_STYLE[src])
+    for f, ax in enumerate(panels):
+        ax.set_title(TITLES[f])
+        lo_, hi_ = ax.get_ylim()
+        ax.set_ylim(min(0.0, lo_), hi_)
+    lab = r"Command penetration $\delta_{\mathrm{cmd}}$ [mm]"
+    timeline_finish(fig, panels, align, w, axes[1, 2], ks, "Command penetration over time", "penetration_timeline",
+                    timeline_caption_head(align, counts, ks, share)
+                    + " Command penetration delta_cmd per fingertip (component of J (q_cmd - q) along -f), from the "
+                    "samples with the finger in contact only, shown while at least half of the running episodes have "
+                    "the finger in contact.",
+                    [(axes[0, 0], lab), (axes[1, 0], lab)])
+
+
+def fig_hold_share(demos, rolls, tables):
+    """Hold force of the policy as a share of the demonstrations', per finger and K (ratio of the means)."""
+    ks = [demos[0]["K"], demos[1]["K"]]
+    v = hold_values(demos, rolls)
+    names = FINGERS + ["fingers 2-5"]
+    get = lambda g, c: v[g]["force"][:, c] if c < 5 else v[g]["force"][:, 1:].sum(-1)  # noqa: E731
+    rec = {}
+    for c, name in enumerate(names):
+        d = [get(("demo", i), c) for i in (0, 1)]
+        p = [get(("policy", i), c) for i in (0, 1)]
+        rec[name] = {"mean": [share_ci(d[i], p[i], np.mean, 0.2) for i in (0, 1)],
+                     "median": [share_ci(d[i], p[i], np.median, 0.5) for i in (0, 1)],
+                     "demo_mean": [float(np.mean(x)) for x in d], "policy_mean": [float(np.mean(x)) for x in p],
+                     "demo_in_contact": [float(np.mean(x > args.contact_n)) for x in d],
+                     "policy_in_contact": [float(np.mean(x > args.contact_n)) for x in p], "n": [len(d[0]), len(p[0])]}
+    fin = [r for name in names for r in rec[name]["mean"] if np.isfinite(r[0])]
+    lo = min([0.25] + [r[1] for r in fin if np.isfinite(r[1]) and r[1] > 0]) * 0.5  # room for the value row
+    hi = max([4.0] + [r[2] for r in fin if np.isfinite(r[2])]) * 1.25
+    fig, ax = plt.subplots(figsize=(11, 4.4))
+    for i, k in enumerate(ks):
+        for c, name in enumerate(names):
+            r = rec[name]["mean"][i]
+            x = c + (i - 0.5) * 0.36
+            # the value in a row along the bottom, under its marker (labels next to the markers collide)
+            lab_kw = dict(transform=ax.get_xaxis_transform(), ha="center", va="bottom", fontsize=9)
+            if not np.isfinite(r[0]):
+                ax.text(x, 0.03, "n/a", color=MUTED, **lab_kw)
+                continue
+            ax.text(x, 0.03, f"{100 * r[0]:.0f} %", color=INK, **lab_kw)
+            top = min(r[2], hi)
+            ax.errorbar(x, r[0], yerr=[[r[0] - max(r[1], lo)], [top - r[0]]], fmt="o", color=k_shade(k), markersize=7,
+                        capsize=3, linewidth=1.4, zorder=3)
+            if not np.isfinite(r[2]):
+                ax.plot(x, hi, "^", color=k_shade(k), markersize=6, zorder=3)
+    ax.axhline(1.0, color=INK, linestyle="--", linewidth=1.2)
+    ax.axvline(4.5, color=GRID, linewidth=1.0)
+    ax.set_yscale("log")
+    ax.set_ylim(lo, hi)
+    ticks = [t_ for t_ in (0.125, 0.25, 0.5, 1, 2, 4, 8, 16) if lo <= t_ <= hi]
+    ax.set_yticks(ticks, [f"{100 * t_:g} %" for t_ in ticks])
+    ax.minorticks_off()
+    ax.set_xticks(range(6), TITLES + ["Fingers 2–5\n(sum)"])
+    ax.set_xlim(-0.75, 5.75)
+    ax.grid(axis="x", visible=False)
+    ax.set_ylabel("Policy hold force / demonstrations'")
+    hs = [Line2D([], [], marker="o", linestyle="", color=k_shade(k), markersize=7, label=f"K = {k:g} N/m") for k in ks]
+    hs += [Line2D([], [], color=INK, linestyle="--", linewidth=1.2, label="Same force as the demonstrations"),
+           Line2D([], [], marker="^", linestyle="", color=MUTED, label="Upper bound open")]
+    fig.legend(handles=hs, loc="lower center", ncol=4, bbox_to_anchor=(0.5, -0.02))
+    suptitle(fig, "Policy hold force relative to the demonstrations")
+    layout(fig, 0.1)
+    tables["hold_share"] = rec
+    save(fig, "hold_share",
+         f"Mean hold force of the policy's successful rollouts divided by that of the demonstrations at the same K, "
+         f"per finger and for fingers 2–5 together (per episode the median force over its last {args.hold_s:g} s, "
+         "episodes without contact counted with their zero force, so the ratio is the share of the average grip "
+         "force). Bars: 95 % bootstrap interval (episodes resampled within each group); log scale, 100 % = the same "
+         "force as the demonstrations. Ratio of the means rather than of the medians because several fingers are out "
+         "of contact in more than half of the episodes (median 0); the ratio of the medians is in the table. n/a: the "
+         "demonstrations' mean below 0.2 N. Triangle: the interval has no upper bound (the demonstrations' resampled "
+         "mean falls below 0.2 N).")
 
 
 def fig_admittance_law(demos):
@@ -1261,6 +1561,51 @@ def write_tables(t, ks):
     table("Grip force in the hold [N], median [IQR] over successful episodes; ratio of the medians [95 % bootstrap] "
           "(– : a median below 0.5 N)", ["source", "finger", f"K = {ks[0]:g}", f"K = {ks[1]:g}", "ratio"], rows, "llccc")
 
+    def fmt_ratio(r):
+        return "–" if not np.isfinite(r[0]) else f"{r[0]:.2f} [{r[1]:.2f}, {r[2]:.2f}]"
+
+    rows = []
+    for key, v in t["hold_penetration"].items():
+        src, fin = key.split(" | ")
+        ref = v.get("ref_median")
+        rows.append([SRC_LABEL[src], fin] + [f"{v['median'][i]:.1f} [{v['iqr'][i][0]:.1f}, {v['iqr'][i][1]:.1f}]"
+                                             for i in (0, 1)]
+                    + [fmt_ratio(v["ratio"]), f"{v['n'][0]} / {v['n'][1]}",
+                       "–" if ref is None else f"{ref[0]:.1f} / {ref[1]:.1f}"])
+    table("Command penetration delta_cmd in the hold [mm], median [IQR] over the successful episodes with the finger in "
+          "contact; ratio of the medians K high / K low [95 % bootstrap] (– : fewer than 3 episodes or a median below "
+          "1 mm); the demonstrations' median reference penetration delta_ref",
+          ["source", "finger", f"K = {ks[0]:g}", f"K = {ks[1]:g}", "ratio", "episodes", "delta_ref (demos)"], rows,
+          "llccccc")
+
+    def pct(r):
+        if not np.isfinite(r[0]):
+            return "–"
+        up = "∞" if not np.isfinite(r[2]) else f"{100 * r[2]:.0f}"
+        return f"{100 * r[0]:.0f} % [{100 * r[1]:.0f}, {up}]"
+
+    rows = []
+    for fin, v in t["hold_share"].items():
+        rows.append([fin] + sum([[pct(v["mean"][i]), pct(v["median"][i]),
+                                  f"{100 * v['demo_in_contact'][i]:.0f} / {100 * v['policy_in_contact'][i]:.0f} %"]
+                                 for i in (0, 1)], []))
+    table("Hold force of the policy as a share of the demonstrations' at the same K: ratio of the means and of the "
+          "medians over the successful episodes [95 % bootstrap; ∞: open upper bound] (– : the demonstrations' mean "
+          "below 0.2 N / median below 0.5 N); share of the episodes with the finger in contact, demos / policy",
+          ["finger", f"K = {ks[0]:g}: mean", f"K = {ks[0]:g}: median", f"K = {ks[0]:g}: in contact",
+           f"K = {ks[1]:g}: mean", f"K = {ks[1]:g}: median", f"K = {ks[1]:g}: in contact"], rows, "lcccccc")
+
+    rows = []
+    for key, pair in t["hold_policy_vs_demo"].items():
+        fin = key.split(" | ")[1]
+        rows.append([fin] + sum([[("–" if not np.isfinite(p["diff"]) else f"{p['diff']:+.1f}"), pct(p["ratio"])]
+                                 for p in pair], []))
+    table("Command penetration delta_cmd in the hold, policy against the demonstrations at the same K: difference of "
+          "the medians (policy − demos) [mm] and their ratio policy / demos [95 % bootstrap; ∞: open upper bound] "
+          "(– : fewer than 3 episodes in contact or a median below 1 mm)",
+          ["finger", f"K = {ks[0]:g}: difference", f"K = {ks[0]:g}: ratio", f"K = {ks[1]:g}: difference",
+           f"K = {ks[1]:g}: ratio"], rows, "lcccc")
+
     fr = t["force_ratio"]
     rows = [[e["source"], f"{e['fingers_2_5']:.2f}" + (f" [{e['ci'][0][0]:.2f}, {e['ci'][0][1]:.2f}]" if e["ci"] else ""),
              f"{e['thumb']:.2f}" + (f" [{e['ci'][1][0]:.2f}, {e['ci'][1][1]:.2f}]" if e["ci"] else "")] for e in fr["entries"]]
@@ -1358,6 +1703,9 @@ def main():
     IL_KS = tuple(ks)
     fig_outcome(stats, tables["mcnemar"])
     fig_hold_force(demos, rolls, tables)
+    fig_hold_share(demos, rolls, tables)
+    fig_grip_timeline(demos, rolls, tables)
+    fig_penetration_timeline(demos, rolls, tables)
     fig_admittance_law(demos)
     fig_penetration(sc, demos, rolls, tables)
     fig_force_ratio(sc, demos, rolls, tables)

@@ -443,7 +443,10 @@ def share_ci(d, p, stat, min_den):
     for i in range(args.boot):
         den = stat(rng.choice(d, len(d)))
         b[i] = stat(rng.choice(p, len(p))) / den if den >= min_den else np.inf
-    return [float(stat(p) / stat(d)), float(np.percentile(b, 2.5)), float(np.percentile(b, 97.5))]
+    # nearest-rank percentiles: linear interpolation between two infinite resamples gives inf - inf = NaN
+    # (and a RuntimeWarning); "lower" / "higher" pick a resample, so an open bound stays inf
+    return [float(stat(p) / stat(d)), float(np.percentile(b, 2.5, method="lower")),
+            float(np.percentile(b, 97.5, method="higher"))]
 
 
 def policy_vs_demo(d, p, min_median):

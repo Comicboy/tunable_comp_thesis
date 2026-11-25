@@ -1550,7 +1550,8 @@ def write_tables(t, ks):
                    + [" & ".join(esc(c) for c in r) + r"\\" for r in rows] + [r"\bottomrule\end{tabular}\end{table}", ""])
 
     m = t["mcnemar"]
-    table(f"Task outcome ({t['outcome'][0]['n']} rollouts per K, same cube positions; exact McNemar p = {m['p']:.2f})",
+    p_str = f"p = {m['p']:.3f}" if m["p"] >= 0.001 else "p < 0.001"  # 0.00 read like an error
+    table(f"Task outcome ({t['outcome'][0]['n']} rollouts per K, same cube positions; exact McNemar {p_str})",
           ["K [N/m]", "success", "95 % CI", "lifted, no 3 s hold", "lifted < 15 cm", "never lifted", "mean time to success [s]"],
           [[f"{r['K']:g}", f"{r['k']}/{r['n']}", f"{100 * r['lo']:.0f}–{100 * r['hi']:.0f} %", str(r["nohold"]),
             str(r["partial"]), str(r["never"]), f"{r['t_mean']:.1f}"] for r in t["outcome"]], "lcccccc")
@@ -1647,10 +1648,10 @@ def write_tables(t, ks):
                "gain in joint space [95 % CI] (kswap_test.py)", "samples"], rows, "lcccc")
     if "comparison" in t:
         table(f"Policy against the admittance at the same state ({KS_SET}; training demonstrations as a reference): "
-              "gain g [95 % CI] per phase, median |error| of the command penetration at the own / swapped K [mm], "
+              "gain g [95 % CI] per phase, median absolute error of the command penetration at the own / swapped K [mm], "
               "median signed error own / swapped [mm], median yield own / swapped [mm], the policy's yield as a share "
               "of the admittance's at the own K (least squares); approach: fingertip distance",
-              ["finger", "phase", "samples", "g", "g (training)", "|error| own / swapped", "|error| (training)",
+              ["finger", "phase", "samples", "g", "g (training)", "abs. error own / swapped", "abs. error (training)",
                "signed error", "yield", "policy / admittance yield, own K [95 % CI]"],
               comparison_table_rows(t["comparison"], t.get("comparison_train")), "llcccccccc")
     p = t["precontact"]

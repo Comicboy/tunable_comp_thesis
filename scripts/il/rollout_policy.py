@@ -30,7 +30,8 @@ Each episode starts with --settle_s (1 s) of holding the start pose (the cube se
 the robot also stood still before the clutch was released), then the policy takes over.
 An episode ends as in the demos: success (cube bottom >= 15 cm above the table for 3 s, the env's
 "success" term), the cube off the table, or the time limit (--episode_s, default 30 s: the demos
-took 8.5-12.7 s from the clutch). The server's action queue is reset at every episode start.
+took 8.5-12.7 s from the clutch, the perturbation demos 9-22 s). The server's action queue is reset at
+every episode start.
 
 Results: one line per episode, a summary (success rate, time to success), and a JSON file
 (default logs/il_eval/<tag>_<inference>_K<K>_seed<seed>.json, <inference> = n100 or te0.01 as reported
@@ -56,9 +57,14 @@ episode runs as above until the cube has been held at the success height for --p
 still (speed below --push_still_speed) for --push_still_s, i.e. the lift is over (the success termination
 is switched off in this mode). That is the push moment: a constant horizontal force of --push_force N
 then acts on the cube for --push_s, is released, and the run continues for --release_s and ends there.
-The direction is taken from the grip at that moment: "away" pushes the cube away from fingers 2-5 (toward
-the thumb, the fingertips are unloaded), "into" pushes it into fingers 2-5 (they are loaded); the force
-stays fixed in the world frame. The scene is saved at the push moment, and from there one of three
+The direction is taken from the grip at that moment, with the same rule and names as the perturbations
+in the demos (teleop_lift.py --perturb): along the normal of the cube face the thumb presses on (of the
+cube's two horizontal axes, the one closest to the force on the thumb), "push" = toward the thumb (the
+cube pressed into the thumb), "pull" = away from it (toward the index and middle finger); the force acts
+at the cube's centre and stays fixed in the world frame. The push moment also needs the grasp at the
+fingertips: the thumb and at least one of fingers 2-5 in contact (> 0.5 N); otherwise it waits (up to
+--push_max_wait_s). (Before 2026-11-25: "away" / "into" from the summed force of fingers 2-5, i.e. tilted
+by the ring finger's side-face contact.) The scene is saved at the push moment, and from there one of three
 conditions acts:
 
     policy   the policy keeps acting (what is being tested); it simply continues the run
@@ -127,8 +133,8 @@ parser.add_argument("--cam_lookat", type=float, nargs=3, default=[0.20, 0.0, -0.
 parser.add_argument("--push", action="store_true", help="push test in the hold (see the module docstring)")
 parser.add_argument("--push_from", nargs="+", default=None, metavar="JSON",
                     help="push test: take the first --episodes episodes that succeeded in all these result files")
-parser.add_argument("--push_dirs", nargs="+", choices=["away", "into"], default=["away", "into"],
-                    help="push away from fingers 2-5 (toward the thumb) and/or into them")
+parser.add_argument("--push_dirs", nargs="+", choices=["push", "pull"], default=["push", "pull"],
+                    help="push = toward the thumb, pull = away from it (as the perturbations in the demos)")
 parser.add_argument("--push_conditions", nargs="+", choices=["policy", "law", "frozen"],
                     default=["policy", "law", "frozen"], help="what acts from the push on")
 parser.add_argument("--push_force", type=float, default=2.0, help="push force on the cube [N] (cube weight 2.1 N)")
@@ -163,6 +169,7 @@ import h5py
 import numpy as np
 import torch
 
+from isaaclab.utils.math import matrix_from_quat
 from isaaclab_tasks.utils import parse_env_cfg
 
 import tunable_comp_thesis.tasks  # noqa: F401  (registers the gym tasks)
@@ -423,7 +430,7 @@ def main():
     if ok:
         d = np.array([r["duration_s"] for r in ok])
         print(f"[rollout] time to success (incl. the 3 s hold): mean {d.mean():.1f} s, min {d.min():.1f} s, "
-              f"max {d.max():.1f} s (demos: 8.5-12.7 s)")
+              f"max {d.max():.1f} s (compare with the demos' durations: inspect_demos.py)")
     print(f"[rollout] inference: mean {np.mean([r['infer_ms_mean'] for r in results]):.2f} ms per step, "
           f"max {max(r['infer_ms_max'] for r in results):.1f} ms")
 
@@ -451,6 +458,7 @@ def main():
 # ======================================================================================================
 
 FINGER_TIPS = [f"right_finger{i}_tip_link" for i in range(1, 6)]
+CONTACT_N = 0.5  # [N] smoothed fingertip force that counts as contact (as kswap_test.py and teleop_lift.py)
 WINDOW_S = 0.5  # averaging window of the printed summary [s]
 
 
@@ -492,19 +500,27 @@ def push_test(env, uw, client, episodes, place_cube, hold, settle_steps, state_i
         else:
             cube.set_external_force_and_torque(F, zero, is_global=True)
 
+    def fingertip_grip():
+        """The grasp is at the fingertips: the thumb and at least one of fingers 2-5 touch the cube."""
+        f = hand.tip_forces_filtered[0].norm(dim=-1)
+        return bool(f[0] > CONTACT_N) and bool((f[1:] > CONTACT_N).any())
+
     def push_direction(which):
-        """Horizontal unit vector: from the cube toward fingers 2-5 ("into"), or the opposite ("away").
-        From the forces ON the fingertips (they point from the cube to the finger); thumb as a fallback."""
-        f = hand.tip_forces_filtered[0].clone()
-        f[:, 2] = 0.0
-        s_ = f[1:].sum(dim=0)
-        if float(s_.norm()) > 0.2:
-            d = s_ / s_.norm()
-        elif float(f[0].norm()) > 0.2:
-            d = -f[0] / f[0].norm()
-        else:
-            return None
-        return d if which == "into" else -d
+        """World-frame unit vector, as teleop_lift.py's Perturber: the outward normal of the cube face the thumb
+        presses on (of the cube's two horizontal axes, the one closest to the horizontal part of the force on the
+        thumb, which points from the cube to the thumb); "push" along it (toward the thumb), "pull" against it."""
+        f_thumb = hand.tip_forces_filtered[0, 0].clone()  # world frame
+        f_thumb[2] = 0.0
+        axes = matrix_from_quat(cube.data.root_link_quat_w)[0]  # columns = cube axes in the world
+        vertical = int(torch.argmax(axes[2].abs()))
+        best, n = -1.0, None
+        for i in range(3):
+            if i == vertical:
+                continue
+            c = float(axes[:, i] @ f_thumb)
+            if abs(c) > best:
+                best, n = abs(c), axes[:, i] * (1.0 if c >= 0 else -1.0)
+        return n if which == "push" else -n
 
     def admittance_offsets(e):
         """dq = J+ e per finger, exactly as the action term computes it (e: (1, 5, 3) -> (1, 20))."""
@@ -574,10 +590,12 @@ def push_test(env, uw, client, episodes, place_cube, hold, settle_steps, state_i
             max_held = max(max_held, held)
             if held >= after_steps:
                 min_speed = min(min_speed, speed)
-            if held >= after_steps and (speed < args_cli.push_still_speed or held >= after_steps + wait_steps):
+            grip = fingertip_grip()
+            if held >= after_steps + wait_steps and not grip:
+                return (f"no fingertip grip to push against (thumb and one of fingers 2-5) within "
+                        f"{args_cli.push_max_wait_s:g} s"), None
+            if held >= after_steps and grip and (speed < args_cli.push_still_speed or held >= after_steps + wait_steps):
                 d = push_direction(direction)
-                if d is None:
-                    return "no grip to push against", None
                 return None, {"obs": obs, "o": o, "log": log, "last_action": last_action, "d": d, "speed": speed,
                               "state": copy_state(uw.scene.get_state(is_relative=False)),
                               "f_filt": ctrl._f_filt.clone(), "joint_cmd": hand.joint_command.clone()}

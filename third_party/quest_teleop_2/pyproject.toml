@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quest-teleop2"
+version = "0.1.0"
+description = "Quest 3 teleoperation and demonstration recording for a UR5e and Wuji Hand 2, with a tactile admittance controller"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "scipy",
+    "h5py",
+    "pyyaml",
+    "matplotlib",
+    "aiohttp",
+    "torch",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+# Installed from git by environment.yml; listed here for documentation only.
+robot = ["ur_rtde"]
+
+[tool.setuptools.packages.find]
+include = ["quest_teleop2*"]
+
+[tool.setuptools.package-data]
+quest_teleop2 = ["quest/client/*.html"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

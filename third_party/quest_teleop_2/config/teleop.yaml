@@ -1,0 +1,96 @@
+# Quest input mapping and retargeting.
+#
+# BOTH HANDS ARE TRACKED; no controller is used. Confirmed on this headset:
+# Quest Browser reports two 'oculus-hand' input sources and no Touch controller
+# in the same WebXR session, so a hand-plus-controller split is not available.
+#
+#   Right hand : wrist pose drives the TCP, thumb-index pinch drives the gripper
+#   Left hand  : thumb-index pinch is the clutch (see input.clutch)
+#   Keyboard   : episode save / discard / task selection
+#
+# Safety comes from the physical e-stop, not from software.
+
+server:
+  port: 8080
+  send_hz: 60
+
+input:
+  # 'hands'      both hands tracked, no controller (what this headset supports)
+  # 'controller' right hand tracked + left controller held -- kept for hardware
+  #              where Meta's Multimodal mode is exposed to WebXR
+  mode: hands
+
+  # How motion is gated. This is NOT a safety device -- the e-stop is. Its job
+  # is letting you reposition your own arm without dragging the robot, and
+  # re-anchoring so your reachable workspace is not limited to wherever your
+  # hand happened to be when tracking started.
+  #
+  #   left_pinch_release  arm TRACKS your right hand; pinch thumb-to-index on
+  #                       your LEFT hand to FREEZE it while you reposition,
+  #                       then release to carry on. Like lifting a mouse.
+  #   left_pinch_hold     inverse: arm only moves while a left pinch is held
+  #   always_on           arm always tracks; no way to reposition
+  #   controller          left controller grip (mode: controller only)
+  clutch: left_pinch_release
+
+  # Motion stays off until you press SPACE. With a 'release' clutch the arm
+  # would otherwise start following the moment tracking appears, before you are
+  # ready. SPACE toggles engage/disengage at any time.
+  start_engaged: false             # WebXR frame rate cap for the client -> server stream
+
+retarget:
+  # WebXR is Y-up / -Z-forward; the UR base frame is Z-up / X-forward. This is
+  # the same change of basis as _R_XR_TO_ISAAC in quest3_device.py, and assumes
+  # you stand behind the robot looking along its +X axis.
+  #   base_x = -xr_z,  base_y = -xr_x,  base_z = +xr_y
+  xr_to_base:
+    - [0, 0, -1]
+    - [-1, 0, 0]
+    - [0, 1, 0]
+
+  # Extra rotation about the base Z axis, degrees. Use this instead of editing
+  # the matrix above when you want to stand somewhere other than directly
+  # behind the robot.
+  yaw_offset_deg: 0.0
+
+  pos_scale: 1.0          # hand travel -> TCP travel. <1 gives finer control.
+  rot_scale: 1.0
+
+  # Ignore sub-millimetre jitter around the anchor so the arm sits still when
+  # your hand is nominally still.
+  deadband_m: 0.002
+  deadband_rad: 0.01
+
+gripper:
+  # Thumb-tip (joint 4) to index-tip (joint 9) distance, metres.
+  # Two thresholds, not one: a single threshold chatters when the measured
+  # distance sits on the boundary, which is harmless in sim and is not on a
+  # real end-effector.
+  #
+  # Measured range on this operator's hand: 4 mm (full pinch) to 141 mm (open).
+  # Deliberately tighter than the naive 30%/55% split of that measured range
+  # (which suggested 45/79 mm), because a relaxed hand rests around 60-80 mm and
+  # would sit right on that boundary -- the gripper would trip on a resting hand.
+  pinch_close_m: 0.030     # below this -> close
+  pinch_open_m: 0.055      # above this -> open
+
+controller:
+  # Which hand holds the controller. The other hand is the tracked one.
+  handedness: left
+
+  # Meta Quest Touch under the 'xr-standard' mapping. NOTE: MDN's generic table
+  # is wrong for Quest -- the thumbstick is axes[2]/[3], not [0]/[1], and A/B
+  # are buttons[4]/[5]. Verify with quest_button_test.py rather than trusting
+  # either source.
+  buttons:
+    trigger: 0            # start episode
+    squeeze: 1            # CLUTCH / deadman -- hold for the arm to move
+    thumbstick: 3         # re-anchor without moving
+    a: 4                  # save episode   (X on the left controller)
+    b: 5                  # discard episode (Y on the left controller)
+  axes:
+    thumbstick_x: 2
+    thumbstick_y: 3
+
+  # Analog buttons are noisy at the edges; treat as pressed above this.
+  press_threshold: 0.6

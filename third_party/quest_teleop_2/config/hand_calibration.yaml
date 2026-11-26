@@ -1,0 +1,21 @@
+# Where the operator's hand maps onto the robot's joints.
+# Measure with:  python scripts/troubleshooting/teleop_hand.py --calibrate
+# Delete this file to fall back to the built-in defaults.
+
+# Subtracted from each finger's MCP flexion, radians, thumb..pinky.
+# The thumb is 0: its joint 0 is a saddle axis, not a knuckle.
+knuckle_trim: [0.0, 0.025, 0.086, 0.104, 0.240]
+
+# Thumb opposition (joint 1). Only `rest` moves; the joint's limits are the
+# other two knots. Measured 2026-10-09: a relaxed thumb sits at +0.622 rad,
+# and the joint's upper limit is +0.698, so it starts 4.3 deg from the stop.
+# Lowering `output` buys headroom back at the cost of the rest pose matching.
+thumb_j1:
+  rest:
+    input: 0.6224
+    output: 0.6224
+
+# Per-joint travel multipliers, applied after the trim so rest stays put.
+# thumb_ip reads small from WebXR and the solver's w_couple damps it further.
+joint_gain:
+  thumb_ip: 1.4

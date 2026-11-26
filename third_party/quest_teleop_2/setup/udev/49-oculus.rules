@@ -1,0 +1,9 @@
+# Meta Quest -- adb access without root.
+#
+# VID 2833 is Oculus/Meta. Without this, `adb devices` shows the headset as
+# "no permissions" and the adb reverse that makes http://localhost:8080 reach
+# the Mac/PC will not work.
+#
+# The Quest changes product ID depending on mode (MTP, charging, adb enabled),
+# so this matches on vendor alone rather than chasing PIDs.
+SUBSYSTEM=="usb", ATTR{idVendor}=="2833", MODE="0666", GROUP="plugdev", TAG+="uaccess"

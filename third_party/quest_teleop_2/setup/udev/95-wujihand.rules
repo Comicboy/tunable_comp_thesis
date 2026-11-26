@@ -1,0 +1,14 @@
+# Wuji Hand -- USB access without root.
+#
+# VID 0483 is STMicroelectronics; the hand enumerates as a CDC-ACM device
+# (verified on macOS: WUJIHAND / WUJITECH, bDeviceClass 2).
+#
+# wujihandpy talks to it through libusb rather than the serial node, so it needs
+# permission on the raw USB device, not just on /dev/ttyACM*. The MODE line is
+# what Wuji's own README prescribes; the plugdev group line is added so access
+# does not depend on world-writable device nodes.
+SUBSYSTEM=="usb", ATTR{idVendor}=="0483", MODE="0666", GROUP="plugdev", TAG+="uaccess"
+
+# The CDC serial node the kernel also creates for the same device. Not used by
+# wujihandpy, but harmless to make accessible and useful for debugging.
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0483", MODE="0666", GROUP="dialout"

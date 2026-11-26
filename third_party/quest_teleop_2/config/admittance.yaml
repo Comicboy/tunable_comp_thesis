@@ -1,0 +1,14 @@
+# The hand's admittance to the glove's contact forces (quest_teleop2/control/admittance.py):
+#     M e'' + D e' + K e = -F w,    q_cmd = clip(q_ref + e, 0, 1)
+# e is the command minus the operator's reference, in normalised joint units (1 = the
+# joint's full range); F a finger's pressure above rest, summed over its cells in contact.
+# The stiffness K comes from --stiffness; anything here can be overridden on the command line.
+mass: 0.2
+damping_ratio: 1.0        # D = 2 * ratio * sqrt(K * M), unless --damping is given
+max_deviation: 0.4        # largest |e| on any joint
+weights:                  # how a finger's force spreads over its joints [j0, j1, j2, j3]; j1 is abduction
+  thumb:  [0.577, 0.0, 0.577, 0.577]
+  index:  [0.577, 0.0, 0.577, 0.577]
+  middle: [0.577, 0.0, 0.577, 0.577]
+  ring:   [0.577, 0.0, 0.577, 0.577]
+  little: [0.577, 0.0, 0.577, 0.577]

@@ -1,0 +1,29 @@
+# Objects the reach can find with SAM 3: --sam --object NAME.
+#   prompt     SAM 3 text prompt
+#   height_m   object height; the approach rises by its excess over calibrated_with
+#   area_cm2   plausible top-view area, as SAM 3 measures it on the table plane
+#   min_score  lowest SAM 3 score accepted (default 0.6)
+calibrated_with: cube
+
+objects:
+  cube:                  # the white block, one side shorter
+    prompt: white block  # 0.87 standing on its stand; 'white cube' scores 0.62-0.69 there
+    height_m: 0.05
+    area_cm2: [25, 90]   # 47-54 measured on its stand
+    min_score: 0.75
+  pyramid:               # the white printed pyramid, tilted on its stand
+    prompt: white object # 0.66-0.92 over two positions; 'white pyramid' 0.89 at one, 0 at the other
+    height_m: 0.05       # planned as the cube: its baseline ran without a rise
+    area_cm2: [25, 90]   # 49-51 measured on its stand
+    min_score: 0.6       # SAM aims at the object; the reorient demos' background detector at
+                         # object and stand together, 38 mm apart at the stand's far end
+  parallelepiped:        # the longer white block, lying along its stand
+    prompt: white block  # 0.76-0.90 over 8 reaches on 2026-11-16
+    height_m: 0.05       # approached as the cube: its first runs had no rise
+    area_cm2: [25, 150]
+    min_score: 0.6
+  flat_pyramid:          # the white pyramid with a flat top, tilted on its stand
+    prompt: white block  # 0.88-0.94 over 10 reaches on 2026-11-16
+    height_m: 0.05
+    area_cm2: [25, 150]
+    min_score: 0.6

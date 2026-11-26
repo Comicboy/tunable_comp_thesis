@@ -1,0 +1,35 @@
+# The camera rig.
+#
+# ORDER IN THIS FILE IS RIG ORDER, and it is baked into every dataset recorded
+# with it: images go to obs/images/<name> and the names are stored in
+# env_args.camera_names. Reordering after recording swaps the model's inputs.
+# Adding or removing a camera means re-recording.
+#
+# Cameras are keyed by SERIAL, never /dev/videoN -- the number is USB assignment
+# order and changes on replug, which would silently swap wrist for static.
+# Find serials with:  python -m quest_teleop2.vision.camera --list
+#
+# exposure/white_balance/focus are pinned rather than left on auto. Auto-exposure
+# makes appearance drift between demos and again at deployment; that is a
+# nuisance variable which can simply be removed. exposure is in units of 100 us,
+# so it also caps frame rate: 250 = 25 ms = 40 fps ceiling.
+#
+# Tune with `python scripts/camera_live.py --tile`, which prints these lines on
+# quit. Focus is per-camera because the two sit at very different distances:
+# the static camera is ~1 m from the table, the wrist camera ~20 cm from the
+# object. focus 0 is INFINITY, which is right for the static camera and wrong
+# for the wrist one.
+
+cameras:
+  - {name: static, serial: "19AF453D", focus: 0, exposure: 250, white_balance: 4000}
+
+  # focus 0 is INFINITY, and it is correct here even though this camera works at
+  # ~20 cm -- verified, not assumed. Swept 0..255 with the hand actually holding
+  # the cube: the centre-crop score peaks at 0 and falls monotonically, so the
+  # lens has enough depth of field to cover 20 cm to across-the-room at once.
+  #
+  # Do not re-derive this from a sweep with the arm at home. Most of that frame
+  # is the lab, so a whole-frame score picks the focus that suits the ROOM and
+  # tells you nothing about the object. `--sweep-focus` now prints a centre
+  # column for exactly this reason; read that one.
+  - {name: wrist, serial: "5C60E934", focus: 0, exposure: 250, white_balance: 4000}

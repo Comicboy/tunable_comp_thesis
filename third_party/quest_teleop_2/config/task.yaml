@@ -1,0 +1,23 @@
+# Pick-and-place task definition.
+#
+# There is no camera, so the policy cannot see where the object is. Instead the
+# operator selects the start and goal on the left controller before each episode
+# (X cycles start, Y cycles goal), and that selection is recorded as a one-hot
+# in the observation. 4 starts x 2 goals = 8 task variants.
+
+name: pick_place
+
+starts: [s0, s1, s2, s3]
+goals: [g0, g1]
+
+# TCP poses [x, y, z, rx, ry, rz] in the robot base frame, metres and axis-angle.
+#
+# Leave these empty and fill them with:
+#     python scripts/record_demos.py --teach
+# which jogs-and-captures each point rather than making you measure them.
+#
+# They are NOT used by the policy (which only ever sees the one-hot). They are
+# recorded alongside each episode so you can sanity-check that the operator
+# actually went where the label says, and so replay can verify reachability.
+start_poses: {}
+goal_poses: {}

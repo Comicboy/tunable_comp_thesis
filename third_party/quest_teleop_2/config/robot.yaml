@@ -1,0 +1,104 @@
+# UR5e connection, servo, and safety limits.
+#
+# Everything here is enforced HOST-SIDE before a target reaches the robot. It is
+# not a substitute for the safety limits configured on the teach pendant -- set
+# conservative pendant limits too.
+
+connection:
+  host: "192.168.1.10"
+  rtde_port: 30004        # RTDE protocol
+  script_port: 30002      # secondary interface, for uploading the servo program
+  dashboard_port: 29999   # dashboard server, used to read robot mode
+
+control:
+  frequency_hz: 125       # RTDE + servoJ rate. Safe on a non-realtime kernel; 500 is not.
+
+  # How often an action is RECORDED, and how fast a policy is stepped. The
+  # servo loop above is unchanged -- one action is taken every
+  # frequency_hz / record_hz = 5 ticks.
+  #
+  # 25 Hz is deliberate, not incidental: DROID records at 15, the Berkeley and
+  # NYU dexterous-hand systems at 16-20, ALOHA/ACT at 50. Coarser steps give a
+  # shorter effective horizon and less compounding error, which matters with
+  # ~80 demonstrations. Keep it an integer divisor of frequency_hz, or the
+  # period stops being uniform.
+  record_hz: 25
+
+  # servoj(q, 0, 0, t, lookahead_time, gain)
+  # lookahead_time is what absorbs host scheduling jitter -- do not shrink it
+  # to chase responsiveness before looking at a tracking-error plot.
+  servoj:
+    lookahead_time: 0.1
+    gain: 300
+
+safety:
+  # Axis-aligned box in the ROBOT BASE frame, metres. Targets are clamped into it.
+  #
+  # IMPORTANT with the Wuji hand fitted: these bound the CONFIGURED TCP, not the
+  # physical fingertips. If the pendant's tool offset is still at the flange,
+  # this z floor protects the flange while the fingers reach below it. Set
+  # Installation -> General -> TCP before relying on the floor.
+  #
+  # On the foam table (2026-11-20), from the TCP read where the operator put the arm: y min
+  # is the far right corner (0.887, -0.148) plus 2 cm, and the z floor is the TCP height with
+  # the wrist turned for the reorientation. x and y max are as before. The box used with the
+  # object on its stand is in config/robot_stand.yaml.
+  workspace:
+    x: [0.15, 0.90]       # forward reach, away from the base
+    y: [-0.168, 0.60]     # side to side
+    z: [0.03, 0.55]       # floor: the lowest pose of the reorientation (TCP read at 0.0294)
+
+  # Slack on the workspace ABORT check only, metres. The box above clamps
+  # COMMANDED targets; this applies to the MEASURED TCP, which lags its target
+  # and overshoots a boundary slightly. The recorded demonstrations reach
+  # z=0.0994 against a limit of 0.10, so a zero-tolerance abort fires on
+  # sub-millimetre servo lag -- it stopped a policy rollout that was working,
+  # right at the drop. A policy genuinely heading out of the cell clears 2 cm
+  # easily.
+  workspace_tolerance: 0.02
+
+  # Hard ceiling on commanded TCP motion, per control tick. This is what stops
+  # a fast hand movement or a tracking glitch becoming a fast robot movement,
+  # independent of the pendant speed slider.
+  max_linear_speed: 0.25      # m/s
+  max_angular_speed: 1.0      # rad/s
+
+  # Largest single-tick jump tolerated before the target is treated as a
+  # tracking glitch and the tick is held instead.
+  max_jump_linear: 0.05       # m
+  max_jump_angular: 0.35      # rad
+
+  # Ceiling on commanded JOINT speed. Used by replay and policy rollout, which
+  # command joints directly and so bypass the Cartesian caps above.
+  max_joint_speed: 1.0        # rad/s per joint
+  max_jump_joint: 0.1         # rad, largest accepted single-tick joint change
+
+  # Ceiling on how fast the commanded joint speed may CHANGE.
+  #
+  # max_joint_speed bounds velocity but not its derivative. A policy whose
+  # opening target is far from home therefore gets clamped to full speed on the
+  # very first tick -- 0 to 1 rad/s in 8 ms is 125 rad/s^2, several times a
+  # UR5e's own joint acceleration limit. The robot answers with a
+  # PROTECTIVE_STOP before the arm has visibly moved, which reads like a bad
+  # policy but is really a step in commanded velocity.
+  #
+  # servoj's 0.1 s lookahead smooths a single-tick spike; it cannot absorb a
+  # sustained ramp, which is exactly what an unconverged checkpoint produces
+  # when its first target sits 0.15 rad away. 4.0 reaches full speed in 0.25 s.
+  # Lower it if protective stops persist; raise it only with a reason.
+  max_joint_accel: 4.0        # rad/s^2 per joint
+
+  # Software force guard; the pendant's own limit bottoms out at 100 N.
+  max_tcp_force: 30.0         # N
+
+  # Must match the pendant's payload (measured 2026-11-04: hand, camera, mount).
+  payload_kg: 1.01
+  payload_tolerance_kg: 0.2
+
+  # Quest data older than this -> motion disabled, arm holds position.
+  quest_timeout_s: 0.2
+  rtde_timeout_s: 0.5
+
+# Joint configuration every episode starts from. Set with scripts/set_home.py.
+home_q: [3.08356, -1.28656, 1.79830, -0.51865, -4.69383, 0.00381]
+home_speed: 0.3             # rad/s for the blocking moveJ to home

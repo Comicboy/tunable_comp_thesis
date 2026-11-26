@@ -1,0 +1,19 @@
+name: teleop
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - numpy
+  - scipy
+  - h5py
+  - pyyaml
+  - matplotlib
+  - pip
+  - pip:
+      - aiohttp
+      - torch
+      - tqdm
+      # UR5e control. SDU Robotics' ur_rtde -- C++ core, Python bindings.
+      # Replaced UR's official RTDE client, which can only read and write
+      # registers and cannot do motion control.
+      - ur_rtde

@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>UR5e Quest Teleop</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: system-ui, -apple-system, sans-serif;
+    background: #0f0f1a; color: #e6e6ff;
+    display: flex; flex-direction: column; align-items: center;
+    justify-content: center; min-height: 100vh; gap: 20px; padding: 24px;
+  }
+  h1 { font-size: 26px; font-weight: 700; text-align: center; }
+  #btn {
+    padding: 20px 44px; font-size: 22px; border-radius: 16px;
+    background: #5c6bc0; color: #fff; border: none; cursor: pointer;
+  }
+  #btn:disabled { opacity: 0.4; cursor: default; }
+  #boot {
+    font-size: 14px; opacity: 0.7; background: rgba(255,255,255,0.07);
+    padding: 12px 20px; border-radius: 8px; max-width: 460px;
+    text-align: center; line-height: 1.6;
+  }
+
+  /* ---- In-headset HUD (dom-overlay). Only visible inside the XR session. ---- */
+  #hud {
+    display: none;
+    position: fixed; inset: 0;
+    pointer-events: none;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  #hud.active { display: block; }
+  #panel {
+    position: absolute; left: 50%; bottom: 6vh; transform: translateX(-50%);
+    min-width: 460px; padding: 16px 22px;
+    background: rgba(8, 8, 20, 0.82);
+    border: 1px solid rgba(140, 160, 255, 0.35);
+    border-radius: 14px;
+    font-size: 17px; line-height: 1.75;
+  }
+  .row { display: flex; justify-content: space-between; gap: 28px; }
+  .k { opacity: 0.55; }
+  .v { font-weight: 600; }
+  .ok   { color: #7dffa8; }
+  .warn { color: #ffd479; }
+  .bad  { color: #ff8a8a; }
+  .idle { color: #9aa3c7; }
+  #banner {
+    position: absolute; left: 50%; top: 8vh; transform: translateX(-50%);
+    padding: 14px 30px; border-radius: 12px; font-size: 22px; font-weight: 700;
+    background: rgba(8, 8, 20, 0.85); opacity: 0; transition: opacity 0.25s;
+  }
+  #banner.show { opacity: 1; }
+</style>
+</head>
+<body>
+  <h1>UR5e Quest Teleop</h1>
+  <button id="btn" disabled>Start Teleop</button>
+  <div id="boot">Connecting to host…</div>
+
+  <div id="hud">
+    <div id="banner"></div>
+    <div id="panel">
+      <div class="row"><span class="k">hand</span>      <span class="v" id="h-hand">—</span></div>
+      <div class="row"><span class="k">clutch</span>    <span class="v" id="h-clutch">—</span></div>
+      <div class="row"><span class="k">pinch</span>     <span class="v" id="h-pinch">—</span></div>
+      <div class="row"><span class="k">task</span>      <span class="v" id="h-task">—</span></div>
+      <div class="row"><span class="k">episode</span>   <span class="v" id="h-episode">—</span></div>
+      <div class="row"><span class="k">robot</span>     <span class="v" id="h-robot">—</span></div>
+      <div class="row"><span class="k">saved</span>     <span class="v" id="h-saved">—</span></div>
+    </div>
+  </div>
+
+<script>
+"use strict";
+
+const CFG = __CONFIG__;
+
+// WebXR hand joints in spec order. We look each one up by name rather than
+// relying on XRHand iteration order, so the array indices are guaranteed and
+// match JOINT_NAMES in quest_input.py.
+const JOINT_NAMES = CFG.joint_names;
+
+const btn    = document.getElementById('btn');
+const boot   = document.getElementById('boot');
+const hud    = document.getElementById('hud');
+const banner = document.getElementById('banner');
+const el = {
+  hand:    document.getElementById('h-hand'),
+  clutch:  document.getElementById('h-clutch'),
+  pinch:   document.getElementById('h-pinch'),
+  task:    document.getElementById('h-task'),
+  episode: document.getElementById('h-episode'),
+  robot:   document.getElementById('h-robot'),
+  saved:   document.getElementById('h-saved'),
+};
+
+// ---------------------------------------------------------------- transport
+const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+let ws = null;
+let wsReady = false;
+
+function connect() {
+  ws = new WebSocket(wsProto + '//' + location.host + '/ws');
+  ws.onopen = () => {
+    wsReady = true;
+    boot.textContent = 'Host connected. Put the headset on and tap Start Teleop.';
+    btn.disabled = false;
+  };
+  ws.onclose = () => {
+    wsReady = false;
+    btn.disabled = true;
+    boot.textContent = 'Host disconnected — retrying…';
+    setStatus(el.robot, 'host lost', 'bad');
+    setTimeout(connect, 1000);   // survive the host script restarting
+  };
+  ws.onerror = () => { boot.textContent = 'WebSocket error.'; };
+  ws.onmessage = (ev) => {
+    let msg;
+    try { msg = JSON.parse(ev.data); } catch { return; }
+    if (msg.hud) applyHud(msg.hud);
+    if (msg.banner) showBanner(msg.banner.text, msg.banner.kind);
+    if (msg.haptic !== undefined) pulse(msg.haptic);
+  };
+}
+connect();
+
+function send(obj) {
+  if (wsReady && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+}
+function sendDebug(msg) {
+  send({ debug: msg });
+  boot.textContent = msg;
+}
+
+// ---------------------------------------------------------------------- HUD
+function setStatus(node, text, kind) {
+  node.textContent = text;
+  node.className = 'v ' + (kind || 'idle');
+}
+function applyHud(h) {
+  if (h.task     !== undefined) setStatus(el.task, h.task, 'idle');
+  if (h.episode  !== undefined) setStatus(el.episode, h.episode, h.episode_kind || 'idle');
+  if (h.robot    !== undefined) setStatus(el.robot, h.robot, h.robot_kind || 'idle');
+  if (h.saved    !== undefined) setStatus(el.saved, h.saved, 'idle');
+}
+let bannerTimer = null;
+function showBanner(text, kind) {
+  banner.textContent = text;
+  banner.className = 'show ' + (kind || 'idle');
+  banner.style.color = kind === 'ok' ? '#7dffa8' : kind === 'bad' ? '#ff8a8a' : '#e6e6ff';
+  clearTimeout(bannerTimer);
+  bannerTimer = setTimeout(() => { banner.className = ''; }, 1400);
+}
+
+let hapticActuator = null;
+function pulse(intensity) {
+  if (hapticActuator) { try { hapticActuator.pulse(intensity, 60); } catch {} }
+}
+
+// ------------------------------------------------------------------ session
+let xrSession = null, refSpace = null, gl = null;
+let lastSend = 0, frames = 0, lastFpsStamp = 0;
+
+btn.addEventListener('click', async () => {
+  if (!navigator.xr) { sendDebug('ERROR: WebXR unavailable. Is this page on http://localhost:PORT via adb reverse?'); return; }
+  if (!(await navigator.xr.isSessionSupported('immersive-ar'))) {
+    sendDebug('ERROR: immersive-ar not supported by this browser.');
+    return;
+  }
+
+  try {
+    xrSession = await navigator.xr.requestSession('immersive-ar', {
+      requiredFeatures: ['hand-tracking'],
+      optionalFeatures: ['local-floor', 'bounded-floor', 'dom-overlay'],
+      domOverlay: { root: hud },
+    });
+  } catch (e) { sendDebug('ERROR starting session: ' + e.message); return; }
+
+  hud.classList.add('active');
+  btn.disabled = true;
+  btn.textContent = 'Running…';
+
+  xrSession.addEventListener('end', () => {
+    xrSession = null; refSpace = null;
+    hud.classList.remove('active');
+    btn.disabled = false; btn.textContent = 'Start Teleop';
+    send({ session: 'ended' });
+    sendDebug('XR session ended.');
+  });
+
+  try {
+    const canvas = document.createElement('canvas');
+    gl = canvas.getContext('webgl2', { xrCompatible: true, alpha: true })
+      || canvas.getContext('webgl',  { xrCompatible: true, alpha: true });
+    if (!gl) { sendDebug('ERROR: WebGL unavailable'); return; }
+    await gl.makeXRCompatible();
+    xrSession.updateRenderState({ baseLayer: new XRWebGLLayer(xrSession, gl, { alpha: true }) });
+  } catch (e) { sendDebug('ERROR creating base layer: ' + e.message); return; }
+
+  // Prefer a floor-relative space so the anchor does not shift with head pose.
+  for (const type of ['local-floor', 'local', 'viewer']) {
+    try { refSpace = await xrSession.requestReferenceSpace(type); send({ debug: 'refSpace: ' + type }); break; }
+    catch {}
+  }
+  if (!refSpace) { sendDebug('ERROR: no reference space available'); return; }
+
+  send({ session: 'started' });
+  xrSession.requestAnimationFrame(onFrame);
+});
+
+// Report what input sources the headset is actually offering. Quest switches
+// between hand-tracking and controller modes, so "is the controller even in
+// this session?" is the first thing to know when the clutch does not respond.
+setInterval(() => {
+  if (!xrSession) return;
+  send({
+    sources: Array.from(xrSession.inputSources).map(s => ({
+      handedness: s.handedness,
+      isHand: !!s.hand,
+      hasGamepad: !!s.gamepad,
+      buttons: s.gamepad ? s.gamepad.buttons.length : 0,
+      axes: s.gamepad ? s.gamepad.axes.length : 0,
+      profiles: s.profiles || [],
+    })),
+  });
+}, 2000);
+
+// -------------------------------------------------------------------- frame
+function readHand(frame, src) {
+  // All 25 joints must be valid. A partially tracked hand produces a wrist pose
+  // that looks plausible but is wrong, which on a real arm is worse than no
+  // data at all -- the safety layer can react to missing data, not to bad data.
+  //
+  // Every joint pose also carries an orientation, and it is worth sending. The
+  // spec fixes the convention -- -Z along the bone away from the wrist, -Y out
+  // of the palm -- so a relative rotation between two joints gives a signed
+  // anatomical angle directly. That is the only way to recover the thumb's
+  // saddle CMC, which two DoF cannot be reconstructed from positions alone.
+  const joints = new Array(JOINT_NAMES.length);
+  const quats = new Array(JOINT_NAMES.length);
+  for (let i = 0; i < JOINT_NAMES.length; i++) {
+    const space = src.hand.get(JOINT_NAMES[i]);
+    if (!space) return null;
+    const jp = frame.getJointPose(space, refSpace);
+    if (!jp) return null;
+    const p = jp.transform.position, q = jp.transform.orientation;
+    joints[i] = [p.x, p.y, p.z];
+    quats[i] = [q.x, q.y, q.z, q.w];
+  }
+  // JOINT_NAMES[0] is 'wrist', so the wrist quaternion is already in hand.
+  return { joints: joints, quats: quats, wrist_quat: quats[0] };
+}
+
+function readController(frame, src) {
+  // src.hand must be null: a TRACKED HAND also exposes a synthetic gamepad
+  // (pinch buttons, no axes), and accepting it here silently substitutes a
+  // hand for the controller -- so the clutch would be driven by a pinch.
+  if (src.hand || !src.gripSpace || !src.gamepad) return null;
+  const pose = frame.getPose(src.gripSpace, refSpace);
+  if (!pose) return null;
+  const p = pose.transform.position, o = pose.transform.orientation;
+  const gp = src.gamepad;
+
+  if (!hapticActuator && gp.hapticActuators && gp.hapticActuators.length) {
+    hapticActuator = gp.hapticActuators[0];
+  }
+  return {
+    pos: [p.x, p.y, p.z],
+    quat: [o.x, o.y, o.z, o.w],
+    buttons: gp.buttons.map(b => [b.pressed ? 1 : 0, b.value]),
+    axes: Array.from(gp.axes),
+  };
+}
+
+function onFrame(t, frame) {
+  if (!xrSession) return;
+  xrSession.requestAnimationFrame(onFrame);
+
+  // Nothing is drawn -- passthrough plus the DOM overlay is the whole view --
+  // but the framebuffer still has to be bound and cleared each frame.
+  if (gl) {
+    const layer = xrSession.renderState.baseLayer;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, layer ? layer.framebuffer : null);
+    gl.clearColor(0, 0, 0, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  }
+
+  if (!refSpace || !wsReady || t - lastSend < CFG.send_interval_ms) return;
+
+  let hand = null, left = null, ctrl = null, handSeen = false, leftSeen = false;
+
+  for (const src of frame.session.inputSources) {
+    if (src.hand && src.handedness === CFG.tracked_hand) {
+      handSeen = true;
+      hand = readHand(frame, src);
+    } else if (src.hand && src.handedness === CFG.other_hand && CFG.dual_hand) {
+      leftSeen = true;
+      left = readHand(frame, src);
+    } else if (!src.hand && src.gamepad && src.handedness === CFG.controller_hand) {
+      ctrl = readController(frame, src);
+    }
+  }
+
+  send({ t: t, hand: hand, left: left, ctrl: ctrl });
+  lastSend = t;
+
+  // ---- local HUD fields, updated from what we just measured ----
+  if (!handSeen) {
+    setStatus(el.hand, 'not visible', 'bad');
+    setStatus(el.pinch, '—', 'idle');
+  } else if (!hand) {
+    setStatus(el.hand, 'partial', 'warn');
+    setStatus(el.pinch, '—', 'idle');
+  } else {
+    const th = hand.joints[CFG.thumb_tip], ix = hand.joints[CFG.index_tip];
+    const d = Math.hypot(th[0] - ix[0], th[1] - ix[1], th[2] - ix[2]);
+    setStatus(el.pinch, (d * 1000).toFixed(0) + ' mm', d < CFG.pinch_close_m ? 'ok' : 'idle');
+  }
+
+  if (CFG.dual_hand) {
+    if (!leftSeen || !left) {
+      setStatus(el.clutch, 'left hand not visible', 'bad');
+    } else {
+      const th = left.joints[CFG.thumb_tip], ix = left.joints[CFG.index_tip];
+      const d = Math.hypot(th[0] - ix[0], th[1] - ix[1], th[2] - ix[2]);
+      const pinching = d < CFG.pinch_close_m;
+      // Reported from the client's own measurement so the HUD stays responsive
+      // even if the host is momentarily busy; the host remains authoritative.
+      setStatus(el.clutch,
+        pinching ? 'REPOSITION — arm frozen' : 'tracking',
+        pinching ? 'warn' : 'ok');
+    }
+    if (handSeen && hand) setStatus(el.hand, 'tracking', 'ok');
+  } else if (!ctrl) {
+    setStatus(el.clutch, 'no controller', 'bad');
+  } else {
+    const sq = ctrl.buttons[CFG.squeeze_index];
+    const held = sq && sq[1] >= CFG.press_threshold;
+    setStatus(el.clutch, held ? 'HELD — arm live' : 'released', held ? 'ok' : 'idle');
+    if (handSeen && hand) setStatus(el.hand, 'tracking', 'ok');
+  }
+
+  frames++;
+  if (t - lastFpsStamp >= 1000) {
+    send({ fps: frames });
+    frames = 0; lastFpsStamp = t;
+  }
+}
+</script>
+</body>
+</html>

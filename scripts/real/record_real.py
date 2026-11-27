@@ -29,6 +29,10 @@ Time limit and a lost right hand discard the episode and go home.
 Files: one per K, <demo dir>/lift_K<K>.hdf5 (the supervisor's HDF5 layout plus our keys), default
 logs/real/demos/ (train) or logs/real/demos_val/ (val); recording stops being offered once every
 K has --demos-per-k demos. Run scripts/real/test_session.py first after any change.
+
+Start-up order: cameras, Quest server, arm, hand, then the glove. The glove must connect after the
+hand: the hand SDK, starting up, breaks a glove connection that already exists in the same process
+(found 2026-11-27). The script then waits until glove frames arrive, and stops with a message if not.
 """
 
 from __future__ import annotations
@@ -38,6 +42,7 @@ import importlib.util
 import logging
 import math
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -233,23 +238,14 @@ def main() -> int:
     retarget = lambda joints: gripper.to_normalised(retargeter(joints))  # noqa: E731 (as his record_grasps)
     model = HandModel(urdf)
 
-    # ---- glove and admittance ------------------------------------------------------------------------
+    # ---- glove and admittance (the glove is connected later, after the hand) -------------------------
     params = AdmittanceParams(law=args.law, mass=args.mass, max_offset=args.max_offset)
     calibration = GloveCalibration.load(args.calibration)
     floor = args.noise_floor if args.noise_floor.is_file() else None
+    tips = FingerRegions.load(args.regions)
     glove = GloveClient(**({"python": args.glove_python} if args.glove_python else {}))
-    try:
-        glove.start()
-        hand_filter = TactileFingertipAdmittance(
-            glove, gripper, model, FingerRegions.load(args.regions), params, dt=dt,
-            calibration=calibration, regions_path=args.regions, floor_path=floor,
-            ticks_per_record=robot_cfg.control.record_decimation)
-    except Exception as exc:  # noqa: BLE001
-        glove.close()
-        print(f"{RED}Glove: {exc}{RESET}")
-        return 1
 
-    # ---- the session (as his _common.build_session, with our session class) -------------------------
+    # ---- the session's parts (as his _common.build_session) ------------------------------------------
     quest = DualHandInput(teleop_cfg.gripper, pinch_freezes=teleop_cfg.input.pinch_freezes,
                           drive_side=common.drive_side(args))
     server = WebXRServer(teleop_cfg, quest)
@@ -265,14 +261,6 @@ def main() -> int:
         "teleop_pivot": args.pivot,
         "teleop_wrist_offset_m": float(args.wrist_offset) if args.pivot == "wrist" else float("nan"),
     }
-    session = RealTeleopSession(
-        arm=arm, quest=quest, server=server, robot_cfg=robot_cfg, teleop_cfg=teleop_cfg,
-        task_cfg=task_cfg, gripper=gripper, recorder=recorder, hand_retargeter=retarget,
-        cameras=rig, hand_filter=hand_filter, k_values=[float(k) for k in args.stiffness],
-        success=SuccessDetector(SuccessParams(contact_threshold=args.contact_threshold,
-                                              lift_m=args.lift, hold_s=args.hold)),
-        rng=np.random.default_rng(args.seed), time_limit_s=args.time_limit, park_s=PARK_S,
-        show_k=args.show_k, episode_attrs=episode_attrs)
 
     # ---- what is about to happen ---------------------------------------------------------------------
     ks = ", ".join(k_name(float(k)) for k in args.stiffness)
@@ -293,10 +281,10 @@ def main() -> int:
     print(f"  cameras       {', '.join(camera_names) if camera_names else 'none'}")
     print(f"\n{CONTROLS}\n")
     if not args.yes and not common.confirm("The fingers will park and the arm will go home. Proceed?"):
-        glove.close()
         return 1
 
-    # ---- run (order as his record_grasps.py) ---------------------------------------------------------
+    # ---- run (order as his record_grasps.py, except the glove: after the hand) ----------------------
+    hand_filter = None
     try:
         if rig is not None:
             rig.start(lock=True)
@@ -305,6 +293,27 @@ def main() -> int:
         common.print_quest_banner(teleop_cfg.server.port)
         info = arm.connect()
         print(f"Connected. PolyScope {info['polyscope']}, {info['safety_status']}.")
+        if not common.connect_hand(gripper):
+            return 1
+        print(f"Hand connected. {gripper}")
+        # The glove only now: the hand SDK, starting up, breaks a glove connection that already
+        # exists in this process (found 2026-11-27: lost within 1 s of hand.connect(); with the hand
+        # first, the glove streamed undisturbed). His record_grasps connects the glove first.
+        glove.start()
+        wait_for_glove(glove)
+        print(f"Glove streaming: {glove.info.get('serial')}, {glove.rate_hz:.0f} Hz.")
+        hand_filter = TactileFingertipAdmittance(
+            glove, gripper, model, tips, params, dt=dt, calibration=calibration,
+            regions_path=args.regions, floor_path=floor,
+            ticks_per_record=robot_cfg.control.record_decimation)
+        session = RealTeleopSession(
+            arm=arm, quest=quest, server=server, robot_cfg=robot_cfg, teleop_cfg=teleop_cfg,
+            task_cfg=task_cfg, gripper=gripper, recorder=recorder, hand_retargeter=retarget,
+            cameras=rig, hand_filter=hand_filter, k_values=[float(k) for k in args.stiffness],
+            success=SuccessDetector(SuccessParams(contact_threshold=args.contact_threshold,
+                                                  lift_m=args.lift, hold_s=args.hold)),
+            rng=np.random.default_rng(args.seed), time_limit_s=args.time_limit, park_s=PARK_S,
+            show_k=args.show_k, episode_attrs=episode_attrs)
         tool = getattr(arm, "_tool", None)    # the pendant's TCP offset, read by connect()
         if tool is not None:
             session.episode_attrs["tcp_offset_matrix"] = np.asarray(tool, dtype=float)
@@ -316,9 +325,6 @@ def main() -> int:
             session.retargeter.set_offset(d)
             print(f"Wrist pivot: TCP {1000 * tool[2, 3]:.0f} mm out, pivot {1000 * args.wrist_offset:.0f} mm "
                   f"out -> d = {np.round(1000 * d, 1).tolist()} mm (TCP relative to the pivot)")
-        if not common.connect_hand(gripper):
-            return 1
-        print(f"Hand connected. {gripper}")
         # Park the fingers before the arm moves and before servoing: ramp_to blocks.
         gripper.ramp_to(gripper.neutral_pose, seconds=PARK_S)
         arm.move_home()
@@ -328,6 +334,9 @@ def main() -> int:
         return 0
     except SafetyAbort as exc:
         print(f"\n{RED}SAFETY ABORT:{RESET} {exc}")
+        return 1
+    except (RuntimeError, TimeoutError, OSError) as exc:
+        print(f"\n{RED}{exc}{RESET}")
         return 1
     except KeyboardInterrupt:
         return 0
@@ -342,12 +351,26 @@ def main() -> int:
         if rig is not None:
             rig.stop()
         glove.close()
-        stats = hand_filter.tick_stats()
-        print(f"\nServo ticks: {stats['ticks']}, mean {1000 * stats['mean_interval']:.2f} ms, "
-              f"late (> 12 ms) {stats['late_ticks']}; hand repeated reads {gripper.repeated_reads}")
+        if hand_filter is not None:
+            stats = hand_filter.tick_stats()
+            print(f"\nServo ticks: {stats['ticks']}, mean {1000 * stats['mean_interval']:.2f} ms, "
+                  f"late (> 12 ms) {stats['late_ticks']}; hand repeated reads {gripper.repeated_reads}")
         if recorder is not None:
             print(f"Demos in {folder}: {recorder.summary() if args.show_k or recorder.targets_reached else recorder.n_saved}")
         print("Disconnected.")
+
+
+def wait_for_glove(glove: GloveClient, seconds: float = 3.0, min_frames: int = 50) -> None:
+    """Refuse to go on unless glove frames are actually arriving."""
+    t_end = time.monotonic() + seconds
+    while time.monotonic() < t_end and glove.frames < min_frames and not glove.lost:
+        time.sleep(0.05)
+    if glove.lost or glove.frames < min_frames:
+        raise RuntimeError(
+            f"The glove is {'lost' if glove.lost else 'silent'} ({glove.frames} frames in {seconds:g} s). "
+            "To see the glove server's own messages, start it by hand in another terminal and run again:\n"
+            '  "$(python -c \'from quest_teleop2.tactile.glove import GLOVE_PYTHON; print(GLOVE_PYTHON)\')" '
+            '-I "$HIS/scripts/glove/glove_server.py"')
 
 
 if __name__ == "__main__":

@@ -17,4 +17,6 @@ imports nothing from Isaac Lab, so it runs in the `teleop` env. Modules:
                  one recorder per K with delete-last, the hidden weighted K draw
     session      RealTeleopSession: his TeleopSession with our episode flow (home, pinch + release
                  start, automatic success, r / d / h keys, hidden K)
+    wrist_pivot  WristPivotRetargeter: the operator's wrist drives the robot hand's wrist (not the
+                 pendant TCP); pivot_offset() from the TCP offset and the measured mount distance
 """

@@ -58,6 +58,7 @@ from tunable_comp_real.hand_driver import MeasuredWujiHand2
 from tunable_comp_real.hand_model import HandModel
 from tunable_comp_real.session import RealTeleopSession
 from tunable_comp_real.tactile_admittance import GloveCalibration, TactileFingertipAdmittance
+from tunable_comp_real.wrist_pivot import pivot_offset
 
 
 def _load_supervisor_common():
@@ -80,8 +81,8 @@ DEMO_DIRS = {"train": Path("logs/real/demos"), "val": Path("logs/real/demos_val"
 PARK_S = 1.0
 
 CONTROLS = """\
-  Right hand   wrist drives the arm (relative to where you were when the clutch engaged),
-               fingers drive the fingers
+  Right hand   wrist drives the robot hand's wrist (relative to where you were when the clutch
+               engaged), fingers drive the fingers
   Left hand    pinch + release at home: start the episode
                pinch during an episode: freeze the arm while you reposition, release to go on
   Keyboard     h  home (next episode)      r  discard + home      d  delete the last saved demo
@@ -124,6 +125,13 @@ def parse_args() -> argparse.Namespace:
                    help="glove units -> N per finger; used when the file exists, glove units otherwise")
     g.add_argument("--glove-python", type=Path, default=None,
                    help="python of the env that reads the glove (default: his GLOVE_PYTHON)")
+    g = ap.add_argument_group("teleoperation")
+    g.add_argument("--pivot", choices=("wrist", "tcp"), default="wrist",
+                   help="robot point that copies your wrist: the hand's wrist (default, as the sim's "
+                        "--ik_point wrist) or the pendant TCP (his original mapping)")
+    g.add_argument("--wrist-offset", type=float, default=0.0, metavar="M",
+                   help="the hand's base (its wrist), metres out from the flange face along the flange "
+                        "axis; measure with a ruler (default 0 = the flange face)")
     g = ap.add_argument_group("hand and cameras")
     g.add_argument("--hand-cutoff", type=float, default=0.0,
                    help="the driver's command low-pass [Hz]; 0 = off (agreed default, so the admittance "
@@ -147,6 +155,8 @@ def check_args(args, dt: float) -> str | None:
         return f"K above the stability limit {k_max:.0f} N/m at M = {args.mass} kg, dt = {dt * 1000:.0f} ms"
     if args.record and args.show_k:
         return "--show-k is for practice only: recorded demos must not know their K"
+    if args.pivot == "wrist" and not 0.0 <= args.wrist_offset <= 0.25:
+        return f"--wrist-offset {args.wrist_offset} m: expected 0..0.25 m out from the flange face (metres, not mm?)"
     if getattr(args, "left", False):
         return "--left: our hand model and fingertip map are for the right Hand 2"
     if not args.regions.is_file():
@@ -252,6 +262,8 @@ def main() -> int:
         "retarget_lp_alpha": float(lp_alpha) if lp_alpha is not None else float("nan"),
         "home_q": np.asarray(robot_cfg.home_q, dtype=float),
         "record_hz": float(1.0 / robot_cfg.control.record_dt),
+        "teleop_pivot": args.pivot,
+        "teleop_wrist_offset_m": float(args.wrist_offset) if args.pivot == "wrist" else float("nan"),
     }
     session = RealTeleopSession(
         arm=arm, quest=quest, server=server, robot_cfg=robot_cfg, teleop_cfg=teleop_cfg,
@@ -276,6 +288,8 @@ def main() -> int:
     print(f"  success       thumb + one finger > {args.contact_threshold:g} {calibration.unit}, lifted "
           f"{100 * args.lift:g} cm for {args.hold:g} s; time limit {args.time_limit:g} s")
     print(f"  hand          driver low-pass {args.hand_cutoff:g} Hz, retargeter lp_alpha {lp_alpha}")
+    print("  wrist         " + (f"pivot at the hand's wrist, {1000 * args.wrist_offset:g} mm out from the flange"
+                               if args.pivot == "wrist" else "pivot at the pendant TCP (his mapping)"))
     print(f"  cameras       {', '.join(camera_names) if camera_names else 'none'}")
     print(f"\n{CONTROLS}\n")
     if not args.yes and not common.confirm("The fingers will park and the arm will go home. Proceed?"):
@@ -294,6 +308,14 @@ def main() -> int:
         tool = getattr(arm, "_tool", None)    # the pendant's TCP offset, read by connect()
         if tool is not None:
             session.episode_attrs["tcp_offset_matrix"] = np.asarray(tool, dtype=float)
+        if args.pivot == "wrist":
+            if tool is None:
+                print(f"{RED}The pendant's TCP offset was not read; cannot place the wrist pivot.{RESET}")
+                return 1
+            d = pivot_offset(tool, args.wrist_offset)
+            session.retargeter.set_offset(d)
+            print(f"Wrist pivot: TCP {1000 * tool[2, 3]:.0f} mm out, pivot {1000 * args.wrist_offset:.0f} mm "
+                  f"out -> d = {np.round(1000 * d, 1).tolist()} mm (TCP relative to the pivot)")
         if not common.connect_hand(gripper):
             return 1
         print(f"Hand connected. {gripper}")

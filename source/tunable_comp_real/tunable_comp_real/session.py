@@ -25,6 +25,10 @@ Why these methods:
   * go_home is his `h`; ours wraps it.
   * key_hook (his extension point) handles the keys; `d` is added to KEYS.
   * _print_status is replaced by a line with our episode state; nothing on it reveals K.
+  * his WristRetargeter is replaced by WristPivotRetargeter (wrist_pivot.py): the operator's wrist
+    drives the robot hand's wrist, not the TCP (as the sim's --ik_point wrist; 2026-11-26). Its
+    offset starts at zero (exactly his behaviour); record_real.py sets it once the arm has read the
+    pendant's TCP at connect (retargeter.set_offset).
 While waiting at home the hand holds the neutral pose: the frozen branch of his loop repeats the
 last reference, which is set to the neutral pose here, and his tracking-lost fallback (the open
 pose) is replaced by the neutral pose until the episode starts.
@@ -42,6 +46,7 @@ import numpy as np
 from quest_teleop2.teleop.session import TeleopSession
 
 from .episodes import StiffnessRecorders, SuccessDetector, draw_stiffness, k_name
+from .wrist_pivot import WristPivotRetargeter
 
 _log = logging.getLogger(__name__)
 
@@ -65,6 +70,8 @@ class RealTeleopSession(TeleopSession):
         hand cutoff, ...); clock: monotonic seconds (replaceable for offline tests).
         The recorder, if any, must be a StiffnessRecorders; the hand_filter is required."""
         super().__init__(*args, **kwargs)
+        # His loop calls self.retargeter.anchor / target / clear; ours pivots about the hand's wrist.
+        self.retargeter = WristPivotRetargeter(self.teleop_cfg.retarget)
         if self.hand_filter is None:
             raise ValueError("RealTeleopSession needs the hand_filter (TactileFingertipAdmittance)")
         if self.recorder is not None and not isinstance(self.recorder, StiffnessRecorders):
@@ -162,7 +169,8 @@ class RealTeleopSession(TeleopSession):
             self.recorder.pending = {**self.episode_attrs, "idle_s": now - self._t_home,
                                      "k_values": np.asarray(self.k_values, float),
                                      "k_hidden": not self.show_k,
-                                     "time_limit_s": float(self.time_limit_s)}
+                                     "time_limit_s": float(self.time_limit_s),
+                                     "teleop_pivot_offset_m": self.retargeter.offset}
             self._start_episode()            # his: checks the glove and cameras, resets the tick
             if not self.recorder.is_recording:
                 self._seen_pinch = False      # refused (banner says why); wait for the next gate
